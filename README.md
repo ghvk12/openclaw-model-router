@@ -2,13 +2,13 @@
 
 [![CI](https://github.com/ghvk12/openclaw-model-router/actions/workflows/plugin-inspector.yml/badge.svg?branch=main)](https://github.com/ghvk12/openclaw-model-router/actions/workflows/plugin-inspector.yml)
 ![Status](https://img.shields.io/badge/status-pre--alpha-orange)
-![Build Stage](https://img.shields.io/badge/build-step%201%2F10-yellow)
+![Build Stage](https://img.shields.io/badge/build-step%202%2F10-yellow)
 ![OpenClaw](https://img.shields.io/badge/openclaw-%E2%89%A52026.4.20-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
 Tiered model router for [OpenClaw](https://github.com/openclaw/openclaw) — picks the cheapest sufficient model per turn via a heuristic + semantic-kNN classifier.
 
-> **Status: scaffolded (Step 1 of 10).** The plugin loads, registers a `before_model_resolve` hook at priority 100, and currently returns `undefined` for every request — gateway behavior is identical to having the plugin uninstalled. Routing logic is added incrementally per [`DESIGN.md`](./DESIGN.md) §15 implementation order.
+> **Status: config-validated (Step 2 of 10).** The plugin now loads its full four-tier config at register time (`src/config.ts`: typebox schema, `assertSecureUrl` security gate, `DEFAULTS`, `resolveConfig`). Misconfigured installs throw at `register` and are unloaded — better than discovering a bad URL at first request. Routing itself is still a no-op (`before_model_resolve` returns `undefined`); decision logic lands in steps 3–7.
 >
 > The **Build Stage** badge above is bumped manually with each step commit; the **CI** badge reflects the real `plugin-inspector ci` outcome on every push to `main`.
 

@@ -10,17 +10,231 @@
   "uiHints": {
     "enabled": {
       "label": "Enabled",
-      "help": "When false the plugin loads but the before_model_resolve hook returns no override (gateway behavior unchanged)."
+      "help": "Master kill switch. When false the before_model_resolve hook returns no override — gateway behavior is identical to the plugin being uninstalled."
+    },
+    "defaultTier": {
+      "label": "Default Tier",
+      "help": "Tier picked under uncertainty (low classifier confidence). T1 (Flash) recommended; balances cost and quality."
+    },
+    "tiers.T0.provider": { "label": "T0 Provider", "help": "Local provider for trivial turns. 'ollama' is the canonical choice." },
+    "tiers.T0.model": { "label": "T0 Model", "help": "Must be pulled in Ollama. qwen2.5:7b-instruct is a sensible starting point; benchmark against your traffic." },
+    "tiers.T0.url": { "label": "T0 URL", "help": "Loopback only (http://localhost:...) or https://. Plaintext non-loopback URLs are refused." },
+    "tiers.T1.provider": { "label": "T1 Provider", "help": "Cloud provider for the default tier. 'deepseek' recommended." },
+    "tiers.T1.model": { "label": "T1 Model", "help": "DeepSeek's Flash/cheap-tier SKU. Concrete model id depends on what's released at install time." },
+    "tiers.T2.provider": { "label": "T2 Provider", "help": "Cloud provider for the reasoning tier." },
+    "tiers.T2.model": { "label": "T2 Model", "help": "DeepSeek's Pro/reasoning SKU." },
+    "tiers.T3.provider": { "label": "T3 Provider", "help": "Long-context / multimodal / failover provider." },
+    "tiers.T3.model": { "label": "T3 Model", "help": "Gemini's long-context Pro SKU." },
+    "classifier.longContextThreshold": {
+      "label": "Long-Context Threshold (tokens)",
+      "advanced": true,
+      "help": "Prompts estimated above this many tokens are unconditionally routed to T3 (Gemini)."
+    },
+    "classifier.heuristics.maxTrivialChars": {
+      "label": "Max Trivial Chars",
+      "advanced": true,
+      "help": "Prompts shorter than this are eligible for T0 downgrade (still requires semantic agreement)."
+    },
+    "classifier.heuristics.escalateLengthChars": {
+      "label": "Escalate Length (chars)",
+      "advanced": true,
+      "help": "Prompts longer than this are escalated to T2 even without keyword hits."
+    },
+    "classifier.heuristics.trivialPatterns": {
+      "label": "Trivial Patterns (regex[])",
+      "advanced": true,
+      "help": "JS regex strings; a match marks the prompt as a T0 candidate."
+    },
+    "classifier.heuristics.escalatePatterns": {
+      "label": "Escalate Patterns (regex[])",
+      "advanced": true,
+      "help": "JS regex strings; a match escalates the prompt to T2."
+    },
+    "classifier.semantic.enabled": {
+      "label": "Semantic Classifier",
+      "help": "Adds ~30ms via Ollama embed + Qdrant kNN. Strongly recommended once exemplars are seeded."
+    },
+    "classifier.semantic.qdrant.url": {
+      "label": "Qdrant URL",
+      "advanced": true,
+      "help": "Same Qdrant instance as openclaw-memory-rag is fine — collections are namespaced."
+    },
+    "classifier.semantic.qdrant.apiKey": {
+      "label": "Qdrant API Key",
+      "sensitive": true,
+      "advanced": true,
+      "help": "Use ${QDRANT_API_KEY} for env-resolved secrets."
+    },
+    "classifier.semantic.qdrant.collection": {
+      "label": "Exemplar Collection",
+      "advanced": true,
+      "help": "Versioned collection name. Bump suffix when changing embedding model/dim."
+    },
+    "classifier.semantic.embeddings.url": {
+      "label": "Ollama URL (for embeddings)",
+      "advanced": true,
+      "help": "Ollama daemon endpoint."
+    },
+    "classifier.semantic.embeddings.model": {
+      "label": "Embedding Model",
+      "advanced": true,
+      "help": "Must be pulled in Ollama: `ollama pull mxbai-embed-large`."
+    },
+    "classifier.semantic.embeddings.dim": {
+      "label": "Embedding Dim",
+      "advanced": true,
+      "help": "Output dimensionality. mxbai-embed-large = 1024."
+    },
+    "classifier.semantic.topK": {
+      "label": "Top-K Exemplars",
+      "advanced": true,
+      "help": "Number of exemplars considered in the weighted vote."
+    },
+    "classifier.semantic.marginThreshold": {
+      "label": "Confidence Margin",
+      "advanced": true,
+      "help": "Below this, the router falls back to the prior tier (sticky behavior)."
+    },
+    "classifier.semantic.stickyPriorBoost": {
+      "label": "Sticky Prior Boost",
+      "advanced": true,
+      "help": "Multiplier on the prior tier's vote weight. >1 biases toward staying on the same tier turn-to-turn."
+    },
+    "failover.windowSize": {
+      "label": "Failover Window",
+      "advanced": true,
+      "help": "Number of recent calls considered for the per-provider error rate."
+    },
+    "failover.errorRateThreshold": {
+      "label": "Error Rate Threshold",
+      "advanced": true,
+      "help": "Fraction of failures that trips the breaker."
+    },
+    "failover.consecutiveFailureThreshold": {
+      "label": "Consecutive Failures",
+      "advanced": true,
+      "help": "Hard count of back-to-back failures that trips the breaker."
+    },
+    "failover.cooldownMs": {
+      "label": "Cooldown (ms)",
+      "advanced": true,
+      "help": "How long a tripped breaker stays open before a probe call is allowed."
+    },
+    "observability.walDir": {
+      "label": "WAL Directory",
+      "advanced": true,
+      "help": "Where decision JSONL files are written. Hashed prompts only — never raw text."
+    },
+    "observability.logDecisions": {
+      "label": "Log Decisions",
+      "help": "When false, no decision rows are written (router still routes; you just lose the audit trail)."
+    },
+    "observability.sampleRate": {
+      "label": "Decision Sample Rate",
+      "advanced": true,
+      "help": "Fraction of decisions written to the WAL. 1.0 = all decisions; lower for high-traffic deployments."
     }
   },
   "configSchema": {
     "type": "object",
-    "additionalProperties": true,
+    "additionalProperties": false,
     "properties": {
-      "enabled": {
-        "type": "boolean",
-        "default": true,
-        "description": "Master kill switch for the router. When false, the hook is registered but always returns undefined."
+      "enabled": { "type": "boolean", "default": true },
+      "defaultTier": {
+        "type": "string",
+        "enum": ["T0", "T1", "T2", "T3"],
+        "default": "T1"
+      },
+      "tiers": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "T0": { "$ref": "#/definitions/tierConfig" },
+          "T1": { "$ref": "#/definitions/tierConfig" },
+          "T2": { "$ref": "#/definitions/tierConfig" },
+          "T3": { "$ref": "#/definitions/tierConfig" }
+        }
+      },
+      "classifier": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "longContextThreshold": {
+            "type": "number",
+            "default": 200000,
+            "minimum": 1000,
+            "maximum": 10000000
+          },
+          "heuristics": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "maxTrivialChars": { "type": "number", "default": 80, "minimum": 1, "maximum": 4000 },
+              "escalateLengthChars": { "type": "number", "default": 1200, "minimum": 1, "maximum": 100000 },
+              "trivialPatterns": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+              "escalatePatterns": { "type": "array", "items": { "type": "string", "minLength": 1 } }
+            }
+          },
+          "semantic": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "enabled": { "type": "boolean", "default": true },
+              "qdrant": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "url": { "type": "string", "default": "http://localhost:6333" },
+                  "apiKey": { "type": "string" },
+                  "collection": { "type": "string", "default": "router_exemplars_v1" }
+                }
+              },
+              "embeddings": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "url": { "type": "string", "default": "http://localhost:11434" },
+                  "model": { "type": "string", "default": "mxbai-embed-large" },
+                  "dim": { "type": "number", "default": 1024, "minimum": 1, "maximum": 8192 }
+                }
+              },
+              "topK": { "type": "number", "default": 5, "minimum": 1, "maximum": 50 },
+              "marginThreshold": { "type": "number", "default": 0.05, "minimum": 0, "maximum": 1 },
+              "stickyPriorBoost": { "type": "number", "default": 1.3, "minimum": 1, "maximum": 10 }
+            }
+          }
+        }
+      },
+      "failover": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "windowSize": { "type": "number", "default": 20, "minimum": 1, "maximum": 1000 },
+          "errorRateThreshold": { "type": "number", "default": 0.5, "minimum": 0, "maximum": 1 },
+          "consecutiveFailureThreshold": { "type": "number", "default": 3, "minimum": 1, "maximum": 100 },
+          "cooldownMs": { "type": "number", "default": 60000, "minimum": 0, "maximum": 3600000 }
+        }
+      },
+      "observability": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "walDir": { "type": "string", "default": "~/.openclaw/model-router/wal" },
+          "logDecisions": { "type": "boolean", "default": true },
+          "sampleRate": { "type": "number", "default": 1.0, "minimum": 0, "maximum": 1 }
+        }
+      }
+    },
+    "definitions": {
+      "tierConfig": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "provider": { "type": "string", "minLength": 1 },
+          "model": { "type": "string", "minLength": 1 },
+          "url": { "type": "string", "minLength": 1 }
+        },
+        "required": ["provider", "model"]
       }
     }
   }
