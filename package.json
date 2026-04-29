@@ -1,0 +1,76 @@
+{
+  "name": "openclaw-model-router",
+  "version": "0.1.0",
+  "description": "Tiered model router for OpenClaw — heuristic + semantic kNN classifier that picks the cheapest sufficient model per turn (Local Ollama → DeepSeek Flash → DeepSeek Pro → Gemini Pro).",
+  "license": "MIT",
+  "author": "ghvk12",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ghvk12/openclaw-model-router.git"
+  },
+  "bugs": {
+    "url": "https://github.com/ghvk12/openclaw-model-router/issues"
+  },
+  "homepage": "https://github.com/ghvk12/openclaw-model-router#readme",
+  "keywords": [
+    "openclaw",
+    "openclaw-plugin",
+    "model-router",
+    "llm-router",
+    "tiered-routing",
+    "deepseek",
+    "gemini",
+    "ollama"
+  ],
+  "type": "module",
+  "main": "./dist/index.js",
+  "files": [
+    "dist/",
+    "openclaw.plugin.json",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "build:watch": "tsc -p tsconfig.json --watch",
+    "clean": "rm -rf dist",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "plugin:check": "plugin-inspector inspect --no-openclaw",
+    "plugin:ci": "plugin-inspector ci --no-openclaw --runtime --mock-sdk --allow-execute"
+  },
+  "openclaw": {
+    "extensions": [
+      "./dist/index.js"
+    ],
+    "runtimeExtensions": [
+      "./dist/index.js"
+    ],
+    "install": {
+      "defaultChoice": "directory",
+      "minHostVersion": ">=2026.4.20"
+    },
+    "compat": {
+      "pluginApi": ">=2026.4.20"
+    },
+    "build": {
+      "openclawVersion": "2026.4.25",
+      "pluginSdkVersion": "2026.4.25"
+    }
+  },
+  "dependencies": {
+    "typebox": "1.1.31"
+  },
+  "peerDependencies": {
+    "openclaw": ">=2026.4.20"
+  },
+  "devDependencies": {
+    "@openclaw/plugin-inspector": "^0.3.2",
+    "@types/node": "^22.10.0",
+    "typescript": "^5.6.3",
+    "vitest": "^2.1.8"
+  },
+  "engines": {
+    "node": ">=22.14.0"
+  }
+}

@@ -1,0 +1,27 @@
+{
+  "id": "model-router",
+  "name": "Model Router",
+  "description": "Tiered model router for OpenClaw — picks the cheapest sufficient model per turn via heuristic + semantic kNN classification. Routes across Local Ollama, DeepSeek Flash, DeepSeek Pro, and Gemini Pro.",
+  "version": "0.1.0",
+  "kind": "general",
+  "activation": {
+    "onStartup": true
+  },
+  "uiHints": {
+    "enabled": {
+      "label": "Enabled",
+      "help": "When false the plugin loads but the before_model_resolve hook returns no override (gateway behavior unchanged)."
+    }
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": true,
+    "properties": {
+      "enabled": {
+        "type": "boolean",
+        "default": true,
+        "description": "Master kill switch for the router. When false, the hook is registered but always returns undefined."
+      }
+    }
+  }
+}
