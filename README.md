@@ -2,13 +2,13 @@
 
 [![CI](https://github.com/ghvk12/openclaw-model-router/actions/workflows/plugin-inspector.yml/badge.svg?branch=main)](https://github.com/ghvk12/openclaw-model-router/actions/workflows/plugin-inspector.yml)
 ![Status](https://img.shields.io/badge/status-pre--alpha-orange)
-![Build Stage](https://img.shields.io/badge/build-step%202%2F10-yellow)
+![Build Stage](https://img.shields.io/badge/build-step%203%2F10-yellow)
 ![OpenClaw](https://img.shields.io/badge/openclaw-%E2%89%A52026.4.20-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
 Tiered model router for [OpenClaw](https://github.com/openclaw/openclaw) — picks the cheapest sufficient model per turn via a heuristic + semantic-kNN classifier.
 
-> **Status: config-validated (Step 2 of 10).** The plugin now loads its full four-tier config at register time (`src/config.ts`: typebox schema, `assertSecureUrl` security gate, `DEFAULTS`, `resolveConfig`). Misconfigured installs throw at `register` and are unloaded — better than discovering a bad URL at first request. Routing itself is still a no-op (`before_model_resolve` returns `undefined`); decision logic lands in steps 3–7.
+> **Status: heuristic classifier ready (Step 3 of 10).** The plugin loads its full four-tier config (Step 2) and now ships a pure-function heuristic classifier (`src/classifier/heuristics.ts`) that detects trivial vs escalate signals via length thresholds, keyword regexes, code-fence presence, and code-density (file-path + function-call counting). 19 unit tests cover all four trivial/escalate signals, false-positive guards (URLs, conversational slashes, short identifiers), simultaneous-flag handling, and a 100KB performance budget. Routing is still a no-op (`before_model_resolve` returns `undefined`) — the classifier output isn't wired into a decision yet. That's Step 4 (stub decider + WAL) and Step 6 (real decider).
 >
 > The **Build Stage** badge above is bumped manually with each step commit; the **CI** badge reflects the real `plugin-inspector ci` outcome on every push to `main`.
 
