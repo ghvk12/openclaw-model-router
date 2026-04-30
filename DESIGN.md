@@ -148,6 +148,16 @@ To keep the two plugins maintainable as a pair, deliberately reuse:
 > `openclaw@2026.4.25` SDK in §11. The model-router uses `before_model_resolve`,
 > which runs in a *different phase* than memory-rag's `before_prompt_build` —
 > so there's no priority conflict between the two plugins.
+>
+> **Hook availability skew (discovered during Step 4 smoke test, 2026-04-30):**
+> The newer hooks `model_call_started`, `model_call_ended`, and
+> `before_agent_finalize` exist in `openclaw@2026.4.26+` SDK type declarations
+> but are NOT yet recognized by the live gateway runtime in `2026.4.24`. Steps
+> that subscribe to them (Step 8 failover, Step 9 outcome rows) MUST either
+> (a) require a runtime ≥ 2026.4.26 in `peerDependencies`, OR (b) detect at
+> register-time which hooks the runtime accepts and degrade gracefully. The
+> Step 4 implementation defers all newer-hook subscriptions to Step 8 so v0.1
+> stays compatible with both runtime versions.
 
 ## 5. Routing decision algorithm
 

@@ -2,29 +2,32 @@ import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-entry";
 import { adoptLogger, type Logger } from "./logger.js";
 import { resolveConfig, summarizeConfig, type ResolvedConfig } from "./config.js";
+import { runHeuristics } from "./classifier/heuristics.js";
+import { stubDecide } from "./decider-stub.js";
+import { DecisionWAL, type DecisionRow } from "./decision-wal.js";
+import { estimateTokens } from "./tokens.js";
 
 /**
- * Step 2 (per DESIGN.md §15): full config schema is now resolved at register
- * time — but the routing decision itself is still a no-op. The plugin reads
- * its config, validates security gates (assertSecureUrl), logs a one-line
- * summary on `gateway_start`, and continues to return undefined from
- * `before_model_resolve`. Gateway behavior is identical to having the plugin
- * uninstalled.
+ * Step 4 (per DESIGN.md §15): observability before behavior change.
  *
- * What's new vs Step 1:
- *   - resolveConfig(rawCfg) parses the full four-tier configuration.
- *   - Misconfigurations (invalid tier id, plaintext non-loopback URLs,
- *     missing required fields) throw at register time and unload the plugin
- *     — better than discovering them at first request.
- *   - The gateway_start log now prints the concrete tier mapping so
- *     operators can verify their config block landed correctly.
+ * The plugin now produces a real RoutingDecision per turn (via the stub
+ * decider that always returns T1) and writes the decision row to a
+ * daily-rotated JSONL WAL. The actual `modelOverride` is still undefined —
+ * gateway behavior is identical to the plugin being uninstalled, but
+ * operators can now see *what the router would do* via the WAL audit log
+ * before any real routing goes live (Step 7).
  *
- * SDK contract (verified against openclaw@2026.4.25 in DESIGN.md §11):
- *   - register(api) MUST be synchronous; throwing here is fine — the loader
- *     unloads the plugin and the gateway keeps running.
- *   - First non-undefined modelOverride wins (firstDefined merge); we
- *     register at priority 100 to claim authoritative routing once Step 7
- *     wires the real decision.
+ * What's new vs Step 3:
+ *   - `before_model_resolve` runs heuristics + stub decider + WAL append
+ *     on every request.
+ *   - `agent_end` writes a follow-up outcome row keyed by runId so offline
+ *     analysis can join "decision X led to outcome Y".
+ *   - `gateway_start` initializes the WAL directory.
+ *   - `gateway_stop` calls `wal.close()` (no-op today, future-proofed).
+ *
+ * The WAL writer is fail-soft: a misconfigured `walDir`, full disk, or
+ * permission error logs once and drops subsequent writes silently — the
+ * gateway itself never crashes from a routing-audit failure.
  */
 
 const HOOK_PRIORITY = 100;
@@ -41,33 +44,80 @@ export default definePluginEntry({
     try {
       cfg = resolveConfig(readRawConfig(api));
     } catch (err) {
-      // resolveConfig throws on invalid config (security gate, bad tier id,
-      // malformed URL). Log it loudly and re-throw so the loader unloads the
-      // plugin — running with a partial/insecure config is worse than running
-      // without the plugin at all.
       logger.error(`model-router: invalid config — refusing to register: ${String(err)}`);
       throw err;
     }
 
+    const wal = new DecisionWAL(cfg.observability, logger);
+
     api.on(
       "before_model_resolve",
-      (_event, _ctx) => {
+      async (event, _ctx) => {
         if (!cfg.enabled) {
           return undefined;
         }
-        // Step 2 still no-ops: classifier + tier resolution land in steps 3–7.
-        // Returning undefined keeps the harness on its default model.
+
+        // Classify + decide. Wrapped so a bug here can never break the
+        // request — the gateway gets `undefined` (no override) on any
+        // throw, identical to having the plugin uninstalled.
+        try {
+          const t0 = performance.now();
+          const heuristic = runHeuristics(event.prompt ?? "", cfg.classifier.heuristics);
+          const decision = stubDecide(heuristic, cfg);
+          const classifierLatencyMs = performance.now() - t0;
+
+          const tier = cfg.tiers[decision.tier];
+          const row: DecisionRow = {
+            ts: Date.now(),
+            runId: _ctx.runId ?? "",
+            promptHash: DecisionWAL.hashPrompt(event.prompt ?? ""),
+            promptLen: (event.prompt ?? "").length,
+            tokenCountEstimate: estimateTokens(event.prompt ?? ""),
+            tierChosen: decision.tier,
+            providerChosen: tier.provider,
+            modelChosen: tier.model,
+            confidence: decision.confidence,
+            classifiers: decision.classifiers,
+            reason: decision.reason,
+            classifierLatencyMs,
+            priorTier: null,
+            failoverApplied: false,
+          };
+
+          // Fire-and-forget — never await. A slow disk shouldn't add
+          // latency to the user request. WAL is best-effort observability,
+          // not on the critical path.
+          void wal.appendDecision(row);
+        } catch (err) {
+          logger.warn(
+            `model-router: classifier/WAL failure (request continues unaffected): ${String(err)}`,
+          );
+        }
+
+        // Step 4 still no-ops on routing — Step 7 wires the real override.
         return undefined;
       },
       { priority: HOOK_PRIORITY },
     );
 
-    api.on("gateway_start", (_event, _ctx) => {
+    // NOTE: outcome-row subscription (model_call_ended) is intentionally
+    // deferred to Step 8 (failover circuit breaker), per DESIGN.md §15.
+    // Step 4's scope is "decision-wal.ts + stub decider" only — decision
+    // rows give us "real-traffic JSONL" without needing per-call latency,
+    // and waiting until Step 8 lets us add version-aware subscription logic
+    // (the live gateway 2026.4.24 doesn't yet expose model_call_ended to
+    // non-bundled plugins; only 2026.4.26+ does — see DESIGN.md §11).
+    // The `OutcomeRow` type and `wal.appendOutcome` method are already in
+    // place for Step 8 to wire up.
+
+    api.on("gateway_start", async (_event, _ctx) => {
+      await wal.init();
       logRouterReady(logger, cfg);
     });
 
-    api.on("gateway_stop", (_event, _ctx) => {
-      logger.info("model-router: gateway_stop received (skeleton; no resources to close yet)");
+    api.on("gateway_stop", async (_event, _ctx) => {
+      await wal.close();
+      logger.info("model-router: gateway_stop received — WAL closed");
     });
 
     logger.info(
@@ -96,9 +146,6 @@ function logRouterReady(logger: Logger, cfg: ResolvedConfig): void {
     logger.info("model-router: ready — disabled via config (no overrides will be issued)");
     return;
   }
-  // Two-line ready summary so the config snapshot stays grep-able even when
-  // logs interleave with other plugins. The first line announces readiness;
-  // the second prints the concrete tier mapping operators care about.
-  logger.info("model-router: ready — skeleton (config validated; no model overrides yet)");
+  logger.info("model-router: ready — stub decider (always T1; WAL active; no model overrides yet)");
   logger.info(`model-router: config ${summarizeConfig(cfg)}`);
 }

@@ -2,13 +2,13 @@
 
 [![CI](https://github.com/ghvk12/openclaw-model-router/actions/workflows/plugin-inspector.yml/badge.svg?branch=main)](https://github.com/ghvk12/openclaw-model-router/actions/workflows/plugin-inspector.yml)
 ![Status](https://img.shields.io/badge/status-pre--alpha-orange)
-![Build Stage](https://img.shields.io/badge/build-step%203%2F10-yellow)
+![Build Stage](https://img.shields.io/badge/build-step%204%2F10-yellow)
 ![OpenClaw](https://img.shields.io/badge/openclaw-%E2%89%A52026.4.20-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
 Tiered model router for [OpenClaw](https://github.com/openclaw/openclaw) — picks the cheapest sufficient model per turn via a heuristic + semantic-kNN classifier.
 
-> **Status: heuristic classifier ready (Step 3 of 10).** The plugin loads its full four-tier config (Step 2) and now ships a pure-function heuristic classifier (`src/classifier/heuristics.ts`) that detects trivial vs escalate signals via length thresholds, keyword regexes, code-fence presence, and code-density (file-path + function-call counting). 19 unit tests cover all four trivial/escalate signals, false-positive guards (URLs, conversational slashes, short identifiers), simultaneous-flag handling, and a 100KB performance budget. Routing is still a no-op (`before_model_resolve` returns `undefined`) — the classifier output isn't wired into a decision yet. That's Step 4 (stub decider + WAL) and Step 6 (real decider).
+> **Status: observability before behavior change (Step 4 of 10).** The plugin now writes a daily-rotated JSONL Write-Ahead Log to `~/.openclaw/model-router/wal/decisions-YYYY-MM-DD.jsonl` for every `before_model_resolve` invocation. A stub decider (`src/decider-stub.ts`) always returns `T1`, so the WAL captures *what the router would do* without any real routing happening yet. The decision row schema matches `DESIGN.md` §8 exactly: `ts`, `runId`, `promptHash` (sha256 of normalized prompt — never raw text), `promptLen`, `tokenCountEstimate`, `tierChosen`, `providerChosen`, `modelChosen`, `confidence`, `classifiers`, `reason`, `classifierLatencyMs`, `priorTier`, `failoverApplied`. The WAL writer is fail-soft: full disk / bad path / permission errors log once and silently drop subsequent writes. 76 unit tests cover hashing stability, sampling, daily rotation, concurrent-append correctness, fail-soft init, and a privacy-shape contract that pins the `OutcomeRow` field set so future refactors can't accidentally leak conversation content. Routing itself is still a no-op (`before_model_resolve` returns `undefined`) — Step 7 wires the live `modelOverride`. Outcome-row subscription (`model_call_ended`) is deferred to Step 8 due to a runtime/SDK version skew (live gateway 2026.4.24 vs SDK types 2026.4.26) — see DESIGN.md §11.
 >
 > The **Build Stage** badge above is bumped manually with each step commit; the **CI** badge reflects the real `plugin-inspector ci` outcome on every push to `main`.
 
