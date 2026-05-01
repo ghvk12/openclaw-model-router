@@ -342,6 +342,49 @@ describe("DecisionWAL — daily rotation", () => {
   });
 });
 
+describe("DecisionWAL — lazy init (regression: --local mode never fires gateway_start)", () => {
+  it("appends successfully without an explicit init() call", async () => {
+    // Simulates the embedded `--local` agent runner that does NOT fire
+    // gateway_start. Step 4 originally relied on gateway_start to call
+    // init() before any append() — that silently dropped every WAL row
+    // in --local mode.
+    const wal = new DecisionWAL(baseCfg(), logger);
+    const path = await wal.appendDecision(sampleDecisionRow());
+    expect(path, "lazy init should let the first append succeed").toBeDefined();
+    const contents = await readFile(path!, "utf8");
+    expect(contents, "row should land on disk").toContain('"runId":"run-abc-123"');
+    expect(
+      logCalls.some((c) => c.msg.includes("WAL ready at")),
+      "lazy init should still log the readiness message",
+    ).toBe(true);
+  });
+
+  it("only logs 'WAL ready' once across many concurrent first-time appends", async () => {
+    const wal = new DecisionWAL(baseCfg(), logger);
+    await Promise.all(
+      Array.from({ length: 20 }, (_, i) =>
+        wal.appendDecision({ ...sampleDecisionRow(), runId: `concurrent-${i}` }),
+      ),
+    );
+    const readyLogs = logCalls.filter((c) => c.msg.includes("WAL ready at"));
+    expect(
+      readyLogs.length,
+      "single-flight init should log readiness exactly once",
+    ).toBe(1);
+  });
+
+  it("an explicit init() after a lazy init is a no-op (idempotent)", async () => {
+    const wal = new DecisionWAL(baseCfg(), logger);
+    await wal.appendDecision(sampleDecisionRow()); // triggers lazy init
+    await expect(
+      wal.init(),
+      "explicit init after lazy init should resolve cleanly",
+    ).resolves.toBeUndefined();
+    const readyLogs = logCalls.filter((c) => c.msg.includes("WAL ready at"));
+    expect(readyLogs.length, "init should not double-log readiness").toBe(1);
+  });
+});
+
 describe("DecisionWAL — close", () => {
   it("close() is a no-op that doesn't throw on a fresh WAL", async () => {
     const wal = new DecisionWAL(baseCfg(), logger);

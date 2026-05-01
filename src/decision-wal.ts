@@ -109,8 +109,11 @@ export class DecisionWAL {
   private readonly cfg: ObservabilityConfig;
   private readonly logger: Logger;
   private readonly resolvedDir: string;
-  /** True after init(); blocks appends from racing the directory creation. */
+  /** True after init() succeeds; blocks appends from racing dir creation. */
   private ready = false;
+  /** Single-flight init Promise — first append OR gateway_start triggers it,
+   *  later callers wait on the same Promise instead of re-entering init(). */
+  private initPromise: Promise<void> | null = null;
   /** Suppresses log spam when the FS is repeatedly failing (e.g. disk full). */
   private failureCountInWindow = 0;
   private failureWindowStart = 0;
@@ -125,11 +128,25 @@ export class DecisionWAL {
   }
 
   /**
-   * Create the WAL directory. Should be called from `gateway_start` so any
-   * permission / volume issues surface in boot logs rather than at the
-   * first user request.
+   * Create the WAL directory. Idempotent — safe to call from `gateway_start`
+   * AND lazily from the first append. The dual-call design exists because
+   * the embedded `--local` agent runner does NOT fire `gateway_start`
+   * (verified during Step 4 smoke testing), so relying on gateway_start
+   * alone would silently drop every WAL row in `--local` mode.
    */
   async init(): Promise<void> {
+    if (this.initPromise) {
+      // Another caller already triggered init — share the in-flight Promise
+      // rather than racing a second mkdir. ensureDir is idempotent so this
+      // is a defense-in-depth measure, not a correctness requirement.
+      await this.initPromise;
+      return;
+    }
+    this.initPromise = this.runInit();
+    await this.initPromise;
+  }
+
+  private async runInit(): Promise<void> {
     if (!this.cfg.logDecisions) {
       this.logger.info(
         "model-router: WAL disabled via observability.logDecisions=false (no rows will be written)",
@@ -202,8 +219,17 @@ export class DecisionWAL {
   // ── Internals ─────────────────────────────────────────────────────────
 
   private async append(row: WalRow): Promise<string | undefined> {
-    if (!this.ready || !this.cfg.logDecisions) {
+    if (!this.cfg.logDecisions) {
       return undefined;
+    }
+    // Lazy init so the WAL works even when `gateway_start` never fires
+    // (e.g. `openclaw agent --local` embedded runner). Cost is paid once
+    // per process; subsequent appends short-circuit on `this.ready`.
+    if (!this.ready) {
+      await this.init();
+      if (!this.ready) {
+        return undefined; // init failed — drop silently (already logged)
+      }
     }
     if (this.cfg.sampleRate < 1.0 && Math.random() >= this.cfg.sampleRate) {
       return undefined;
