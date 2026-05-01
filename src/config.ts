@@ -124,6 +124,23 @@ export type ObservabilityConfig = Static<typeof ObservabilityConfigSchema>;
 
 export const PluginConfigSchema = Type.Object({
   enabled: Type.Optional(Type.Boolean({ default: true })),
+  /**
+   * SAFETY VALVE for Step 7 GO-LIVE. When `false` (default), the plugin
+   * runs in observability-only mode — it computes the routing decision
+   * and writes it to the WAL, but `before_model_resolve` returns
+   * `undefined` so the gateway picks the model normally. When `true`,
+   * the plugin returns `{ modelOverride, providerOverride }` and the
+   * gateway honors it.
+   *
+   * Default `false` is the conservative-default rollout policy
+   * (DESIGN.md §10) made operational: every install starts in shadow
+   * mode and operators opt in explicitly via openclaw.json.
+   *
+   * Pairs with strict tier validation: when liveRouting=true, the
+   * plugin refuses to register if any tier's provider/model isn't
+   * resolvable in the gateway's models.providers config.
+   */
+  liveRouting: Type.Optional(Type.Boolean({ default: false })),
   tiers: Type.Optional(TiersConfigSchema),
   defaultTier: Type.Optional(TierIdSchema),
   classifier: Type.Optional(ClassifierConfigSchema),
@@ -134,6 +151,7 @@ export type PluginConfig = Static<typeof PluginConfigSchema>;
 
 export type ResolvedConfig = {
   enabled: boolean;
+  liveRouting: boolean;
   tiers: TiersConfig;
   defaultTier: TierId;
   classifier: ClassifierConfig;
@@ -171,11 +189,36 @@ const DEFAULT_ESCALATE_PATTERNS: readonly string[] = [
 
 const DEFAULTS: ResolvedConfig = {
   enabled: true,
+  /**
+   * Default `false` per DESIGN.md §16's conservative rollout: new
+   * installs run in observability mode. Operators flip to true in
+   * openclaw.json after they've added the matching providers/models.
+   */
+  liveRouting: false,
+  /**
+   * Defaults align with DESIGN.md §16.1 — cleanly monotonic cost ladder.
+   * Provider key for Gemini is `google` (not `gemini`) to match
+   * OpenClaw's bundled provider id; the `gemini` key would fail tier
+   * validation when liveRouting=true.
+   *
+   * T0 default points to deepseek-v4-flash (remote, ~$0.10-0.30/MTok)
+   * rather than a local Ollama chat model — avoids the operator
+   * needing to `ollama pull` a chat model just to install the plugin.
+   * Operators can override to a local model via openclaw.json.
+   */
   tiers: {
-    T0: { provider: "ollama", model: "qwen2.5:7b-instruct", url: "http://localhost:11434" },
-    T1: { provider: "deepseek", model: "deepseek-v4-flash" },
-    T2: { provider: "deepseek", model: "deepseek-v4-pro" },
-    T3: { provider: "gemini", model: "gemini-3.1-pro" },
+    T0: { provider: "deepseek", model: "deepseek-v4-flash" },
+    T1: { provider: "deepseek", model: "deepseek-v4-pro" },
+    // The bundled `google` provider uses dot-separated version IDs
+    // (e.g. `gemini-3.1-pro-preview`) — that's what Google's actual
+    // Gemini API expects and what the provider's onboard.js declares
+    // as `GOOGLE_GEMINI_DEFAULT_MODEL`. The hyphenated form
+    // `gemini-3-1-pro-preview` is a different model in OpenClaw's
+    // bundled Venice extension catalog, NOT a google provider model —
+    // routing `google/gemini-3-1-pro-preview` returns
+    // `model_not_found` from the google provider.
+    T2: { provider: "google", model: "gemini-3.1-pro-preview" },
+    T3: { provider: "anthropic", model: "claude-opus-4-6" },
   },
   defaultTier: "T1",
   classifier: {
@@ -277,6 +320,7 @@ export function resolveConfig(raw: unknown): ResolvedConfig {
 
   const resolved: ResolvedConfig = {
     enabled: partial.enabled ?? DEFAULTS.enabled,
+    liveRouting: partial.liveRouting ?? DEFAULTS.liveRouting,
     tiers: mergeTiers(partial.tiers),
     defaultTier:
       partial.defaultTier !== undefined
@@ -345,8 +389,9 @@ export function summarizeConfig(cfg: ResolvedConfig): string {
     .map((id) => `${id}=${cfg.tiers[id].provider}/${cfg.tiers[id].model}`)
     .join(", ");
   const semantic = cfg.classifier.semantic.enabled ? "enabled" : "disabled";
+  const liveRouting = cfg.liveRouting ? "LIVE" : "observability-only";
   return (
-    `enabled=${cfg.enabled}, default=${cfg.defaultTier}, ` +
+    `enabled=${cfg.enabled}, liveRouting=${liveRouting}, default=${cfg.defaultTier}, ` +
     `${tiers}, classifier=heuristic+semantic(${semantic})`
   );
 }

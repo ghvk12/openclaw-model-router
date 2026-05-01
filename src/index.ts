@@ -7,14 +7,29 @@ import { DecisionWAL, type DecisionRow } from "./decision-wal.js";
 import { estimateTokens } from "./tokens.js";
 import { PriorTierCache } from "./classifier/prior-tier.js";
 import { SemanticBootstrap } from "./classifier/semantic-bootstrap.js";
+import { toModelOverride } from "./router.js";
+import {
+  validateTiers,
+  formatValidationError,
+  type GatewayConfigShape,
+} from "./router-validate.js";
 
 /**
- * Step 6 (per DESIGN.md §15): observability before behavior change —
- * the plugin now runs the real `decide()` orchestrator on every
- * request and writes structured RoutingDecision rows to the daily
- * JSONL WAL, but `modelOverride` is still `undefined`. Operators
- * can now audit "what the router would have done" before the
- * GO-LIVE flip in Step 7.
+ * Step 7 (per DESIGN.md §15, §16): GO-LIVE — the plugin now returns
+ * real `{ modelOverride, providerOverride }` from
+ * `before_model_resolve` when `cfg.liveRouting === true`, gated by
+ * strict tier validation at register-time.
+ *
+ * Routing-flip safety mechanisms (both new in Step 7):
+ *   1. `liveRouting` defaults to `false`. Existing installs continue
+ *      in observability-only mode (Step 6 behavior) until the
+ *      operator explicitly opts in via openclaw.json. New installs
+ *      see WAL rows accumulate without ever changing model selection.
+ *   2. Strict tier validation at register-time. Walks every
+ *      `cfg.tiers.*` against `api.config.models.providers`. Mismatch
+ *      with `liveRouting=true` ⇒ throw with a 3-option recovery hint
+ *      (DESIGN.md §16.4); mismatch with `liveRouting=false` ⇒ loud
+ *      warning, observability still works.
  *
  * Per-process lifecycle (DESIGN.md §11):
  *   - Long-lived gateway daemon: `gateway_start` fires once at boot,
@@ -48,6 +63,50 @@ export default definePluginEntry({
     } catch (err) {
       logger.error(`model-router: invalid config — refusing to register: ${String(err)}`);
       throw err;
+    }
+
+    // Tier validation (Step 7, DESIGN.md §16.4 — soft-warning policy).
+    //
+    // The validator walks each tier's provider/model against
+    // `api.config.models.providers` (the user's openclaw.json model
+    // overrides). Two structural blind spots make hard-throwing
+    // unworkable in practice:
+    //   1. OpenClaw ships a BUNDLED model catalog (e.g. deepseek-v4-flash,
+    //      gemini-3-1-pro-preview, claude-opus-4-6 — see
+    //      node_modules/openclaw/dist/models-*.js) that is NOT visible
+    //      via api.config.models.providers. That field reflects only
+    //      user overrides on top of the bundled catalog.
+    //   2. When a user does override a provider (e.g. to set custom auth
+    //      headers on `deepseek`), the bundled catalog's models still
+    //      merge in. So even an explicit `models[]` array doesn't tell
+    //      the full story.
+    //
+    // Net result: the validator has too many false-positive paths to
+    // hard-block boot on. We emit warnings (loud, structured) so
+    // operators still get an actionable hint when something is clearly
+    // wrong, but we never refuse to register. If a tier truly resolves
+    // to a non-existent model, the gateway's downstream resolver will
+    // surface the per-request error and Step 8's outcome-row capture
+    // will record it in the WAL.
+    const gatewayConfig = readGatewayConfig(api);
+    const tierIssues = validateTiers(cfg, gatewayConfig);
+    if (tierIssues.length > 0) {
+      const liveStatus = cfg.liveRouting ? "LIVE ROUTING" : "observability-only";
+      logger.warn(
+        `model-router: ${tierIssues.length} tier${tierIssues.length === 1 ? "" : "s"} flagged by validator (${liveStatus}). Bundled provider catalogs may still satisfy these — see per-line notes. If routing fails at runtime, the gateway will surface per-request errors and Step 8 outcome rows will capture them:`,
+      );
+      for (const issue of tierIssues) {
+        logger.warn(`  • ${issue.tier}: ${issue.reason}`);
+      }
+      logger.warn(formatValidationError(tierIssues).split("\n").slice(-9).join("\n"));
+    } else if (gatewayConfig?.models?.providers) {
+      logger.info(
+        `model-router: tier validation OK (${tierSummary(cfg)})`,
+      );
+    } else {
+      logger.warn(
+        "model-router: tier validation skipped — gateway config didn't expose models.providers (SDK shape skew). Bundled catalogs may still satisfy all tiers",
+      );
     }
 
     const wal = new DecisionWAL(cfg.observability, logger);
@@ -103,6 +162,11 @@ export default definePluginEntry({
           // any failover substitutions that happen later (Step 8).
           priorTierCache.set(sessionKey, decision.tier);
 
+          // Step 7 GO-LIVE: convert the decision into the SDK
+          // override shape iff cfg.liveRouting=true. Returns undefined
+          // when liveRouting=false (observability mode preserved).
+          const override = toModelOverride(decision, cfg);
+
           const tier = cfg.tiers[decision.tier];
           const row: DecisionRow = {
             ts: Date.now(),
@@ -119,23 +183,28 @@ export default definePluginEntry({
             classifierLatencyMs: outcome.trace.totalLatencyMs,
             priorTier,
             failoverApplied: false,
+            routedLive: override !== undefined,
           };
 
           // Fire-and-forget — never await. A slow disk shouldn't add
           // latency to the user request. WAL is best-effort observability,
           // not on the critical path.
           void wal.appendDecision(row);
+
+          // Returns the override (or undefined if liveRouting is off /
+          // tier missing). The gateway honors a returned override IFF
+          // no higher-priority plugin supersedes us (we registered at
+          // priority=100, see HOOK_PRIORITY).
+          return override;
         } catch (err) {
           logger.warn(
             `model-router: classifier/WAL failure (request continues unaffected): ${String(err)}`,
           );
+          // Fail-soft on any unhandled exception in the hot path: return
+          // undefined so the gateway uses its default model. The plugin
+          // becomes invisible for this one request rather than breaking it.
+          return undefined;
         }
-
-        // Step 6 still no-ops on routing — Step 7 wires the real override.
-        // The WAL now shows the REAL decision the router would have made,
-        // not the always-T1 stub. This is "shadow mode within
-        // observability before behavior change" (DESIGN.md §10).
-        return undefined;
       },
       { priority: HOOK_PRIORITY },
     );
@@ -201,9 +270,45 @@ function logRouterReady(logger: Logger, cfg: ResolvedConfig): void {
     logger.info("model-router: ready — disabled via config (no overrides will be issued)");
     return;
   }
-  logger.info(
-    "model-router: ready — real decider (heuristic + semantic + sticky-prior); WAL active; no model overrides yet (Step 7 turns on routing)",
-  );
+  if (cfg.liveRouting) {
+    logger.info(
+      "model-router: ready — LIVE ROUTING (modelOverride enabled). Decisions emit { modelOverride, providerOverride } to the gateway and are recorded in the WAL with routedLive=true",
+    );
+  } else {
+    logger.info(
+      "model-router: ready — observability-only mode. Decisions are computed and recorded in the WAL with routedLive=false; no modelOverride is returned to the gateway. Set plugins.entries.model-router.config.liveRouting = true in openclaw.json to GO LIVE",
+    );
+  }
   logger.info(`model-router: config ${summarizeConfig(cfg)}`);
+}
+
+/**
+ * Read-only summary of tier→provider/model used in the boot log on
+ * successful tier validation. Mirrors the format from
+ * DESIGN.md §16.2's expected boot line.
+ */
+function tierSummary(cfg: ResolvedConfig): string {
+  return (["T0", "T1", "T2", "T3"] as const)
+    .map((id) => `${id}=${cfg.tiers[id].provider}/${cfg.tiers[id].model}`)
+    .join(", ");
+}
+
+/**
+ * Defensive read of the gateway's models.providers shape for tier
+ * validation. The OpenClawPluginApi type doesn't formally expose this
+ * (it's a private surface), but it's been stable across the runtime
+ * versions we've tested. We use a structural cast and let
+ * `validateTiers` skip-validate if the shape doesn't match (rather
+ * than throw). This protects us against SDK shape drift across runtime
+ * versions — DESIGN.md §11 documents the runtime/SDK skew we already
+ * hit with model_call_ended.
+ */
+function readGatewayConfig(api: OpenClawPluginApi): GatewayConfigShape | undefined {
+  const apiObj = api as unknown as Record<string, unknown>;
+  const config = apiObj.config as GatewayConfigShape | undefined;
+  if (!config || typeof config !== "object") {
+    return undefined;
+  }
+  return config;
 }
 

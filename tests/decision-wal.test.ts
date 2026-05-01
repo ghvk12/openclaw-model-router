@@ -198,6 +198,41 @@ describe("DecisionWAL — append (decision rows)", () => {
     const ids = new Set(lines.map((l) => JSON.parse(l).runId));
     expect(ids.size, "no rows should be duplicated or lost").toBe(50);
   });
+
+  it("round-trips routedLive=true (Step 7 GO-LIVE marker)", async () => {
+    const wal = new DecisionWAL(baseCfg(), logger);
+    await wal.init();
+    await wal.appendDecision({ ...sampleDecisionRow(), routedLive: true });
+
+    const path = wal.filePathForNow();
+    const parsed = JSON.parse((await readFile(path, "utf8")).trim());
+    expect(parsed.routedLive, "routedLive=true should round-trip exactly").toBe(true);
+    expect(parsed.tierChosen, "other fields should still be present").toBe("T1");
+  });
+
+  it("round-trips routedLive=false explicitly (kill-switch verification)", async () => {
+    const wal = new DecisionWAL(baseCfg(), logger);
+    await wal.init();
+    await wal.appendDecision({ ...sampleDecisionRow(), routedLive: false });
+
+    const parsed = JSON.parse((await readFile(wal.filePathForNow(), "utf8")).trim());
+    expect(parsed.routedLive, "routedLive=false should round-trip explicitly").toBe(false);
+  });
+
+  it("backward-compat: rows missing routedLive parse cleanly (treated as false at read time)", async () => {
+    const wal = new DecisionWAL(baseCfg(), logger);
+    await wal.init();
+    // Sample row deliberately omits routedLive — simulates pre-Step-7 history.
+    const preStep7Row: DecisionRow = sampleDecisionRow();
+    await wal.appendDecision(preStep7Row);
+
+    const parsed = JSON.parse((await readFile(wal.filePathForNow(), "utf8")).trim());
+    expect(
+      "routedLive" in parsed,
+      "the field should NOT be serialized when undefined (keeps file size down + audits the absence as 'shadow row')",
+    ).toBe(false);
+    expect(parsed.tierChosen, "core fields still round-trip").toBe("T1");
+  });
 });
 
 function sampleOutcomeRow(): OutcomeRow {

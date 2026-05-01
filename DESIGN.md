@@ -703,26 +703,35 @@ The plugin is shippable when:
 
 ## 16. Step 7 detailed spec — GO-LIVE (the routing flip)
 
-> Status: **Proposed (planning phase, 2026-04-30).** Step 7 is the highest-risk
-> step in the 10-step plan because it's the first one that *changes
-> user-facing behavior*. Until Step 6, the plugin was identical (in observed
-> behavior) to having no plugin installed — every `before_model_resolve`
-> returned `undefined`. Step 7 starts returning real `{ modelOverride,
-> providerOverride }` objects, which the gateway honors. A bad config or a
-> stale model name silently routes every request to the wrong provider, or
-> hard-fails them.
+> Status: **Implemented (verified live 2026-05-01).** All sub-steps 7a-7k
+> shipped. Live smoke matrix confirmed end-to-end: T1 routing returns real
+> deepseek-v4-pro responses; T2 routing reaches Google's API with valid
+> auth (only blocked by free-tier quota — operational, not a router defect).
+> Kill-switch (`liveRouting=false`) verified to record decisions in WAL with
+> `routedLive=false` while bypassing model overrides.
 >
-> This section was written *before* code so the safety design isn't an
-> afterthought. Two things make Step 7 safe-to-ship:
+> The validation policy was relaxed from "strict throw" to "soft warn" in
+> §16.4 below — see "Lessons learned" at the end of this section for the
+> rationale (the bundled-catalog blind spot makes hard-throwing unworkable).
+>
+> Step 7 is the highest-risk step in the 10-step plan because it's the
+> first one that *changes user-facing behavior*. Until Step 6, the plugin
+> was identical (in observed behavior) to having no plugin installed —
+> every `before_model_resolve` returned `undefined`. Step 7 starts
+> returning real `{ modelOverride, providerOverride }` objects, which the
+> gateway honors. A bad config or a stale model name silently routes every
+> request to the wrong provider, or hard-fails them.
+>
+> Two things make Step 7 safe-to-ship:
 >   1. **`liveRouting: false` default** in the plugin manifest's
 >      `configSchema` — every install starts in observability-only mode
 >      (current Step 6 behavior). Users opt in explicitly per `openclaw.json`.
->   2. **Strict tier validation at register-time** — the plugin walks
->      `cfg.tiers.*.{provider, model}` and resolves each against the
+>   2. **Tier validation at register-time** (soft-warning) — the plugin
+>      walks `cfg.tiers.*.{provider, model}` and resolves each against the
 >      gateway's known providers/models from `api.config.models.providers`.
->      Any mismatch when `liveRouting=true` is a fatal `register()` throw,
->      surfaced in the gateway boot log. Mismatch when `liveRouting=false`
->      is a loud warning; observability still works.
+>      Any mismatch is logged with a 3-option recovery hint, but
+>      registration is NOT blocked because the gateway's bundled catalog
+>      may still satisfy the tier. See §16.12 (Lessons learned).
 
 ### 16.1 Tier mapping (operator-confirmed for this install)
 
@@ -950,7 +959,7 @@ In order of severity (least disruptive first):
 
 Step 7 is "done" when ALL of these are true:
 
-1. `npm test` — 164/164 passing (137 + 13 + 14 new)
+1. `npm test` — 179/179 passing (164 baseline + 8 router + 7 router-validate)
 2. `npm run plugin:ci` — PASS
 3. GitHub Actions green on `main`
 4. Live smoke matrix (§16.8) — every prompt's response.model matches its expected tier
@@ -958,6 +967,81 @@ Step 7 is "done" when ALL of these are true:
 6. README "GO-LIVE checklist" — written and copy-pasteable
 7. Build-stage badge bumped to 7/10
 8. DESIGN.md §16 marked `Status: Implemented (verified live YYYY-MM-DD)` once landed
+
+### 16.12 Lessons learned during 7h-7j (live verification)
+
+The Step 7 GO-LIVE produced four non-trivial issues that required design
+adjustments. None of them invalidate the §16.1-§16.10 spec, but they are
+documented here so future steps and operators understand the decisions.
+
+**1. Manifest cache staleness.**
+OpenClaw caches plugin manifests at `openclaw plugins install` time.
+Adding `liveRouting` to `openclaw.plugin.json`'s `configSchema` is
+necessary but not sufficient — existing installs continue to use the old
+cached manifest, which silently strips unknown fields (`liveRouting`,
+`routedLive` markers, etc.) when persisting `openclaw.json`. Mitigation:
+the README's GO-LIVE checklist now includes
+`openclaw plugins install <path>` after upgrading the plugin, so the
+manifest cache refreshes. Step 10 (CI wiring) will verify the manifest's
+configSchema is up-to-date as part of the build.
+
+**2. `openclaw plugins install` creates duplicate sources.**
+Running `openclaw plugins install <workspace-path>` copies the entire
+workspace into `~/.openclaw/extensions/<plugin-id>/`. If the workspace
+path is already in `plugins.load.paths` (which it is for our dev
+workflow), the gateway sees both copies, logs "duplicate plugin id
+detected," and silently fails to load *either* in some configurations.
+Mitigation: after installing for the manifest-refresh side effect (see
+issue 1), immediately remove the duplicate at
+`~/.openclaw/extensions/<plugin-id>/` and the corresponding
+`plugins.installs.<plugin-id>` entry from `openclaw.json`. The README's
+GO-LIVE checklist includes this cleanup step.
+
+**3. Validator's bundled-catalog blind spot — soft-warning only.**
+The `validateTiers` function (§16.4) walks `api.config.models.providers`
+to confirm each tier resolves. But OpenClaw ships a *bundled* model
+catalog (e.g., `dist/models-DTSU8g8c.js` provides deepseek-v4-flash/pro
+even when the user's `models.providers.deepseek.models[]` only lists
+`deepseek-reasoner` and `deepseek-chat`). The bundled catalog is NOT
+visible via `api.config.models.providers` — that field reflects only user
+overrides on top of the bundled catalog.
+
+Initial design (§16.4): hard-throw on any tier mismatch with
+`liveRouting=true`. In practice this produces too many false positives
+— every install with the default tier mapping gets blocked at boot
+because the bundled-catalog models aren't in user config. The validator
+was relaxed to **soft-warning only**: it walks user config and emits
+structured warnings (with the recovery hint) for tiers it can't resolve,
+but never blocks `register()`. The "positive-evidence" rule documented
+in `src/router-validate.ts` makes this explicit: only flag when we have
+positive evidence the model is missing (provider entry exists with
+explicit `models[]` and the tier model isn't in it). Skip everything
+else as bundled-suspect.
+
+If a tier resolves to a non-existent model, the gateway surfaces the
+per-request error directly (e.g.,
+`Unknown model: google/<modelId> (model_not_found)`). Step 8's outcome
+row capture will record these in the WAL alongside the routing decision.
+
+**4. Provider-specific env-var names ≠ generic placeholders.**
+The bundled `google` provider expects `GEMINI_API_KEY` or
+`GOOGLE_API_KEY` env vars (see
+`extensions/google/provider-registration.js`), NOT the generic-sounding
+`GOOGLE_AI_API_KEY` we initially documented in §16.2. macOS LaunchAgents
+do NOT inherit shell env vars; the API key MUST be in the plist's
+`EnvironmentVariables` block under the *exact* var name the provider
+reads. README's GO-LIVE checklist now lists the per-provider env-var
+names with `PlistBuddy` snippets.
+
+**5. Model ID gotcha — dots vs hyphens between version components.**
+The `google` provider's actual Gemini API uses dot-separated version IDs
+(`gemini-3.1-pro-preview`). OpenClaw's bundled `Venice` extension also
+ships a model called `gemini-3-1-pro-preview` (hyphens), which is a
+*different* model exposed via Venice's catalog — NOT compatible with the
+google provider. Routing `google/gemini-3-1-pro-preview` returns
+`model_not_found` from the google provider. The `T2` default in
+`src/config.ts` uses dots (`gemini-3.1-pro-preview`) and includes a
+comment explaining the trap.
 
 ---
 

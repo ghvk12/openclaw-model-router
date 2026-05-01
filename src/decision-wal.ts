@@ -42,6 +42,16 @@ export type DecisionRow = {
   priorTier: TierId | null;
   /** Whether failover.ts substituted the picked tier with a different one. */
   failoverApplied: boolean;
+  /**
+   * Whether the router actually returned `{ modelOverride, providerOverride }`
+   * to the gateway for this decision (i.e. live routing was active and the
+   * tier passed validation). Optional for backward compatibility with WAL
+   * rows written before Step 7 added the field — rows missing this field
+   * are interpreted as `false` ("would have routed but didn't"). The Step 9
+   * audit CLI uses this to distinguish shadow rows from live ones in
+   * historical data without requiring a schema migration.
+   */
+  routedLive?: boolean;
 };
 
 /**

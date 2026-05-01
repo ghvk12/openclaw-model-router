@@ -22,11 +22,16 @@ describe("resolveConfig", () => {
   it("returns DEFAULTS for an empty config", () => {
     const cfg = resolveConfig({});
     expect(cfg.enabled, "enabled should default to true").toBe(true);
+    expect(cfg.liveRouting, "liveRouting should default to false (Step 7 safety valve)").toBe(false);
     expect(cfg.defaultTier, "defaultTier should default to T1").toBe("T1");
-    expect(cfg.tiers.T0.provider, "T0 should default to ollama").toBe("ollama");
+    expect(cfg.tiers.T0.provider, "T0 should default to deepseek").toBe("deepseek");
+    expect(cfg.tiers.T0.model, "T0 should default to deepseek-v4-flash").toBe("deepseek-v4-flash");
     expect(cfg.tiers.T1.provider, "T1 should default to deepseek").toBe("deepseek");
-    expect(cfg.tiers.T2.provider, "T2 should default to deepseek").toBe("deepseek");
-    expect(cfg.tiers.T3.provider, "T3 should default to gemini").toBe("gemini");
+    expect(cfg.tiers.T1.model, "T1 should default to deepseek-v4-pro").toBe("deepseek-v4-pro");
+    expect(cfg.tiers.T2.provider, "T2 should default to google (NOT 'gemini' which would fail validation)").toBe("google");
+    expect(cfg.tiers.T2.model, "T2 should default to gemini-3.1-pro-preview (dots, matches actual Google Gemini API)").toBe("gemini-3.1-pro-preview");
+    expect(cfg.tiers.T3.provider, "T3 should default to anthropic").toBe("anthropic");
+    expect(cfg.tiers.T3.model, "T3 should default to claude-opus-4-6").toBe("claude-opus-4-6");
     expect(
       cfg.classifier.longContextThreshold,
       "longContextThreshold should default to 200K",
@@ -50,25 +55,38 @@ describe("resolveConfig", () => {
       true,
     );
     expect(resolveConfig(42).enabled, "number should resolve to defaults").toBe(true);
+    expect(resolveConfig(null).liveRouting, "null should resolve liveRouting to false").toBe(false);
   });
 
   it("merges enabled flag without disturbing other defaults", () => {
     const cfg = resolveConfig({ enabled: false });
     expect(cfg.enabled, "enabled override should land").toBe(false);
     expect(cfg.tiers.T1.model, "tier defaults should still apply").toBe(
-      "deepseek-v4-flash",
+      "deepseek-v4-pro",
     );
+  });
+
+  it("respects an explicit liveRouting=true override (the Step 7 GO-LIVE flip)", () => {
+    const cfg = resolveConfig({ liveRouting: true });
+    expect(cfg.liveRouting, "liveRouting=true override should land").toBe(true);
+    expect(cfg.enabled, "other defaults should remain").toBe(true);
+    expect(cfg.tiers.T1.model, "tier defaults should remain").toBe("deepseek-v4-pro");
+  });
+
+  it("respects an explicit liveRouting=false override (kill-switch path)", () => {
+    const cfg = resolveConfig({ liveRouting: false, enabled: true });
+    expect(cfg.liveRouting, "explicit false should land (not override default)").toBe(false);
   });
 
   it("allows overriding a single tier without losing the others", () => {
     const cfg = resolveConfig({
-      tiers: { T2: { provider: "anthropic", model: "claude-4.6-sonnet" } },
+      tiers: { T2: { provider: "anthropic", model: "claude-sonnet-4-20250514" } },
     } as unknown);
     expect(cfg.tiers.T2.provider, "T2 override should land").toBe("anthropic");
-    expect(cfg.tiers.T2.model, "T2 model should land").toBe("claude-4.6-sonnet");
-    expect(cfg.tiers.T0.provider, "T0 should remain at default").toBe("ollama");
-    expect(cfg.tiers.T1.model, "T1 should remain at default").toBe("deepseek-v4-flash");
-    expect(cfg.tiers.T3.model, "T3 should remain at default").toBe("gemini-3.1-pro");
+    expect(cfg.tiers.T2.model, "T2 model should land").toBe("claude-sonnet-4-20250514");
+    expect(cfg.tiers.T0.provider, "T0 should remain at default").toBe("deepseek");
+    expect(cfg.tiers.T1.model, "T1 should remain at default").toBe("deepseek-v4-pro");
+    expect(cfg.tiers.T3.model, "T3 should remain at default").toBe("claude-opus-4-6");
   });
 
   it("merges nested classifier.semantic.qdrant fields", () => {
@@ -183,15 +201,17 @@ describe("assertSecureUrl", () => {
 });
 
 describe("summarizeConfig", () => {
-  it("produces a single-line operator-readable summary", () => {
+  it("produces a single-line operator-readable summary with the new defaults", () => {
     const cfg: ResolvedConfig = resolveConfig({});
     const summary = summarizeConfig(cfg);
     expect(summary, "summary should be a single line").not.toContain("\n");
     expect(summary).toContain("enabled=true");
+    expect(summary).toContain("liveRouting=observability-only");
     expect(summary).toContain("default=T1");
-    expect(summary).toContain("T0=ollama/qwen2.5:7b-instruct");
-    expect(summary).toContain("T1=deepseek/deepseek-v4-flash");
-    expect(summary).toContain("T3=gemini/gemini-3.1-pro");
+    expect(summary).toContain("T0=deepseek/deepseek-v4-flash");
+    expect(summary).toContain("T1=deepseek/deepseek-v4-pro");
+    expect(summary).toContain("T2=google/gemini-3.1-pro-preview");
+    expect(summary).toContain("T3=anthropic/claude-opus-4-6");
     expect(summary, "should reflect classifier wiring").toContain("classifier=heuristic+semantic");
   });
 
@@ -205,5 +225,12 @@ describe("summarizeConfig", () => {
       classifier: { semantic: { enabled: false } },
     } as unknown);
     expect(summarizeConfig(cfg)).toContain("semantic(disabled)");
+  });
+
+  it("flips the liveRouting field in the summary when liveRouting=true", () => {
+    const cfg = resolveConfig({ liveRouting: true });
+    const summary = summarizeConfig(cfg);
+    expect(summary, "summary should signal LIVE state to operators reading boot logs").toContain("liveRouting=LIVE");
+    expect(summary, "should NOT contain the observability-only string when live").not.toContain("observability-only");
   });
 });
