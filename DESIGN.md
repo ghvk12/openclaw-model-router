@@ -692,8 +692,272 @@ The plugin is shippable when:
    `modelOverride`.
 8. `src/failover.ts` — circuit breaker, substitution logic.
 9. `src/cli.ts` — `openclaw modelrouter audit` (mirrors `memrag` CLI shape).
+   Includes an `exemplars harvest` sub-command (added per §16's
+   "exemplar tuning scope" decision) that mines high-confidence WAL
+   rows to propose new T0/T1/T2 exemplars for operator approval —
+   data-driven semantic-classifier improvement instead of guesswork.
 10. CI: `plugin-inspector ci --no-openclaw --runtime --mock-sdk --allow-execute`
     (mirrors memory-rag's `plugin:ci` script).
+
+---
+
+## 16. Step 7 detailed spec — GO-LIVE (the routing flip)
+
+> Status: **Proposed (planning phase, 2026-04-30).** Step 7 is the highest-risk
+> step in the 10-step plan because it's the first one that *changes
+> user-facing behavior*. Until Step 6, the plugin was identical (in observed
+> behavior) to having no plugin installed — every `before_model_resolve`
+> returned `undefined`. Step 7 starts returning real `{ modelOverride,
+> providerOverride }` objects, which the gateway honors. A bad config or a
+> stale model name silently routes every request to the wrong provider, or
+> hard-fails them.
+>
+> This section was written *before* code so the safety design isn't an
+> afterthought. Two things make Step 7 safe-to-ship:
+>   1. **`liveRouting: false` default** in the plugin manifest's
+>      `configSchema` — every install starts in observability-only mode
+>      (current Step 6 behavior). Users opt in explicitly per `openclaw.json`.
+>   2. **Strict tier validation at register-time** — the plugin walks
+>      `cfg.tiers.*.{provider, model}` and resolves each against the
+>      gateway's known providers/models from `api.config.models.providers`.
+>      Any mismatch when `liveRouting=true` is a fatal `register()` throw,
+>      surfaced in the gateway boot log. Mismatch when `liveRouting=false`
+>      is a loud warning; observability still works.
+
+### 16.1 Tier mapping (operator-confirmed for this install)
+
+| Tier | Provider key | Model ID | Pricing (per MTok, ≤200K ctx) | Picked when |
+|---|---|---|---|---|
+| **T0** | `deepseek` | `deepseek-v4-flash` | ~$0.10-0.30 | Trivial conversational (heuristic_trivial + semantic_T0 @ >0.80) |
+| **T1** | `deepseek` | `deepseek-v4-pro` | ~$1-3 (similar to V3 R1 range) | Default — anything not confidently classified elsewhere |
+| **T2** | `google` | `gemini-3.1-pro-preview` | $2 / $12 | Multi-step reasoning, code, debug, escalate keywords |
+| **T3** | `anthropic` | `claude-opus-4-6` | $5 / $25 | Long-context (>200K), multimodal, or T2 failover (Step 8) |
+
+Notes:
+1. Cost ladder is cleanly monotonic: T0 ($0.10-0.30) < T1 ($1-3) < T2 ($2-12) < T3 ($5-25). The asymmetric-cost rule (DESIGN.md §5) and the conservative-default policy (§10) both depend on monotonicity holding, so this mapping is well-aligned with the routing algorithm's assumptions.
+2. T1 is now DeepSeek V4 Pro instead of Gemini 3.1 Pro — both because it's cheaper (DeepSeek V4 Pro ≈ $1-3/MTok vs Gemini 3.1 Pro $2 input/$12 output) and because the "default tier" picks up the largest share of traffic, so cost-savings compound there. T2 (Gemini 3.1 Pro Preview) is reserved for prompts where the heuristic or semantic classifier explicitly votes for escalation.
+3. The `provider` key for Gemini in OpenClaw is **`google`**, not `gemini` (the latter would fail to resolve). Step 7 fixes the plugin's DEFAULTS in `src/config.ts` to use `google`.
+4. T0 is a remote model in this install (no local Ollama chat model is pulled). The asymmetric-cost rule still applies — V4 Flash is fast and cheap but a smaller model than V4 Pro / Gemini Pro / Opus (13B active vs 49B+), so quality can still suffer on hard prompts wrongly routed to T0.
+5. **Note on Gemini 3.1 Pro variants:** Google offers two endpoints for this model: `gemini-3.1-pro-preview` (general purpose) and `gemini-3.1-pro-preview-customtools` (optimized for agent workflows with custom tools like `view_file`, `search_code`, bash). v0.1 uses the general endpoint; if OpenClaw's tool-use surface starts dominating T2 traffic, switch to `-customtools` via config.
+
+### 16.2 Pre-conditions (operator MUST do before enabling liveRouting)
+
+1. Update `~/.openclaw/openclaw.json` `models.providers` to register the new model IDs:
+
+   ```json
+   {
+     "models": {
+       "providers": {
+         "deepseek": {
+           "models": [
+             { "id": "deepseek-v4-flash", "contextWindow": 1000000, "cost": { "input": 0.20, "output": 0.40 } },
+             { "id": "deepseek-v4-pro",   "contextWindow": 1000000, "cost": { "input": 1.5,  "output": 6.0  } }
+             // …keep deepseek-chat / deepseek-reasoner for backward compat;
+             //  they auto-route to v4-flash / v4-pro server-side until Jul 24, 2026.
+           ]
+         },
+         "google": {
+           "apiKey": "<GOOGLE_AI_STUDIO_API_KEY>",
+           "models": [
+             { "id": "gemini-3.1-pro-preview", "contextWindow": 1000000, "cost": { "input": 2.0, "output": 12.0 } }
+           ]
+         },
+         "anthropic": {
+           "models": [
+             { "id": "claude-opus-4-6", "contextWindow": 1000000, "cost": { "input": 5.0, "output": 25.0 } }
+             // …keep claude-sonnet-4-20250514 for whatever currently uses it.
+           ]
+         }
+       }
+     }
+   }
+   ```
+
+2. Add the model-router tier override to `plugins.entries.model-router.config`:
+
+   ```json
+   {
+     "plugins": {
+       "entries": {
+         "model-router": {
+           "enabled": true,
+           "config": {
+             "liveRouting": true,
+             "tiers": {
+               "T0": { "provider": "deepseek",  "model": "deepseek-v4-flash" },
+               "T1": { "provider": "deepseek",  "model": "deepseek-v4-pro" },
+               "T2": { "provider": "google",    "model": "gemini-3.1-pro-preview" },
+               "T3": { "provider": "anthropic", "model": "claude-opus-4-6" }
+             },
+             "classifier": {
+               "semantic": { "qdrant": { "apiKey": "<existing key from Step 5>" } }
+             }
+           }
+         }
+       }
+     }
+   }
+   ```
+
+3. Restart the gateway: `openclaw gateway stop && openclaw gateway start`. Look for these log lines confirming Step 7 is active:
+   - `model-router: tier validation OK (T0=deepseek/deepseek-v4-flash, T1=deepseek/deepseek-v4-pro, T2=google/gemini-3.1-pro-preview, T3=anthropic/claude-opus-4-6)`
+   - `model-router: ready — LIVE ROUTING (modelOverride enabled)`
+
+### 16.3 New code: `src/router.ts`
+
+Pure mapper from `RoutingDecision` to the SDK's `PluginHookBeforeModelResolveResult` shape. No I/O, no state — fully unit-testable:
+
+```ts
+export type ModelOverride = { modelOverride?: string; providerOverride?: string };
+
+export function toModelOverride(
+  decision: RoutingDecision,
+  cfg: ResolvedConfig,
+): ModelOverride | undefined {
+  if (!cfg.liveRouting) return undefined;     // observability mode
+  const tier = cfg.tiers[decision.tier];
+  if (!tier) return undefined;                // defensive — validation should catch this earlier
+  return { modelOverride: tier.model, providerOverride: tier.provider };
+}
+```
+
+That's it. The complexity lives in `decide()`; this module just translates.
+
+### 16.4 New validation: `src/router-validate.ts`
+
+Walks `cfg.tiers` against the gateway's `api.config?.models?.providers` at register-time:
+
+```ts
+export type TierValidationIssue = { tier: TierId; reason: string };
+
+export function validateTiers(
+  cfg: ResolvedConfig,
+  gatewayConfig: GatewayConfigShape,   // { models: { providers: {...} } }
+): TierValidationIssue[] {
+  const issues: TierValidationIssue[] = [];
+  for (const [tierId, tier] of Object.entries(cfg.tiers) as [TierId, TierConfig][]) {
+    const provider = gatewayConfig.models?.providers?.[tier.provider];
+    if (!provider) {
+      issues.push({ tier: tierId, reason: `provider "${tier.provider}" not found in models.providers` });
+      continue;
+    }
+    const model = provider.models?.find((m: { id: string }) => m.id === tier.model);
+    if (!model) {
+      issues.push({ tier: tierId, reason: `model "${tier.model}" not found in models.providers.${tier.provider}.models` });
+    }
+  }
+  return issues;
+}
+```
+
+Wired into `register()`:
+- `liveRouting=true` + any issues ⇒ `throw new Error("...")` with the issue list AND a clear recovery hint embedded in the message:
+
+  ```
+  model-router: refusing to register live routing — 1 tier misconfigured:
+    • T2: model "gemini-3.1-pro-preview" not found in models.providers.google.models
+
+  To recover, choose ONE:
+    (a) Add the missing model to ~/.openclaw/openclaw.json under
+        models.providers.google.models, then `openclaw gateway restart`.
+    (b) Set plugins.entries.model-router.config.liveRouting = false in
+        ~/.openclaw/openclaw.json to fall back to observability-only mode
+        (decisions still logged to WAL but no overrides emitted), then
+        `openclaw gateway restart`.
+    (c) Disable the plugin entirely: `openclaw plugins disable model-router`
+        — gateway returns to default model selection.
+  ```
+
+  The throw is loud (gateway boot fails on any missing tier) but the message gives the operator three escape hatches. This satisfies the user's "throw-with-recovery" preference.
+- `liveRouting=false` + any issues ⇒ `logger.warn(...)` with the issue list, continue. Observability still works (decision rows still written; modelOverride is `undefined` regardless).
+- No issues ⇒ `logger.info("model-router: tier validation OK (...)")` and proceed.
+
+### 16.5 WAL row schema extension
+
+Add one optional field to `DecisionRow` (backward-compatible — old rows missing the field are interpreted as `false`):
+
+```ts
+type DecisionRow = {
+  // ...all existing fields...
+  routedLive?: boolean;   // true when modelOverride was actually returned to the gateway
+};
+```
+
+This lets `openclaw modelrouter audit` (Step 9) distinguish:
+- Step 6 era / `liveRouting=false` rows: `routedLive: false` — "what the router *would* have done"
+- Step 7+ live rows: `routedLive: true` — "what the router actually did"
+
+Without this, a year from now no one can tell from the WAL whether a given decision was honored or shadow-mode.
+
+### 16.6 Index.ts wiring change
+
+Three small edits in `src/index.ts`:
+
+1. After `resolveConfig`, before any hook registration: call `validateTiers(cfg, api.config)`. Throw or warn per §16.4 policy.
+2. In `before_model_resolve`, after computing `decision`: call `toModelOverride(decision, cfg)`. If the result is non-undefined, use it as the hook's return value; also set `row.routedLive = true`. Otherwise `routedLive = false`.
+3. Update `logRouterReady` to print "LIVE ROUTING (modelOverride enabled)" when `cfg.liveRouting === true`, vs the current "no model overrides yet" message when `false`.
+
+### 16.7 Sub-step breakdown
+
+| Sub-step | What | Output |
+|---|---|---|
+| **7a** | Update `src/config.ts` — add `liveRouting: Type.Boolean({ default: false })` to `PluginConfigSchema`; fix DEFAULTS to use `google` instead of `gemini` for T3 provider; export the updated `ResolvedConfig` type. Mirror the new field in `openclaw.plugin.json` configSchema. | `cfg.liveRouting` available; `cfg.tiers.T3.provider === "google"` |
+| **7b** | Add `routedLive?: boolean` to `DecisionRow` in `src/decision-wal.ts`. Update existing `decision-wal.test.ts` tests to assert backward compatibility (rows without the field still parse). | WAL schema extended, all 25 existing tests still pass |
+| **7c** | Write `src/router.ts` — `toModelOverride()` pure function (~10 lines) | router module exists, importable from index.ts |
+| **7d** | Write `src/router-validate.ts` — `validateTiers()` pure function (~25 lines) | validator module exists |
+| **7e** | Wire into `src/index.ts` — validation in register(), override in before_model_resolve, routedLive in WAL, logRouterReady update | Plugin returns real overrides when `liveRouting=true`, observability when `false` |
+| **7f** | Tests: `tests/router.test.ts` (~6 tests for toModelOverride: each tier, undefined when liveRouting=false, undefined when tier missing); `tests/router-validate.test.ts` (~8 tests: empty config, all OK, missing provider, missing model, multiple issues, partial provider, etc.) | +14 unit tests, total 164/164 |
+| **7g** | README.md — new "GO-LIVE checklist" section with the EXACT JSON snippets from §16.2 and the rollback procedure. Bump build-stage badge 6/10 → 7/10. Refresh status banner to mention live routing + the safety valve. | Operators have a copy-pasteable enable/disable runbook |
+| **7h** | Build + lint + plugin:ci. Re-build the user's `openclaw.json` to add the missing models + tier overrides + `liveRouting: true`. Restart gateway, verify "tier validation OK" log + "LIVE ROUTING" log. | Plugin loaded with live routing; gateway boots clean |
+| **7i** | Live smoke test — repeat the Step 6 5-prompt matrix (`thanks`, `What's 2+2?`, long Refactor, Python+code, Bloom-filter prose). For each, parse the gateway's JSON response and assert `response.model` matches the WAL row's `modelChosen`. Expected: T2 prompts return from `deepseek-v4-pro`, T1 prompts from `gemini-3-pro-preview`, T0 prompts from `deepseek-v4-flash`. Verify `routedLive: true` in WAL rows. | Empirical proof that routing is live for all five branches |
+| **7j** | Smoke the kill switch — set `liveRouting: false` in `openclaw.json`, restart, send 1 prompt, verify the response uses the gateway's default model (NOT the routed tier) and that the WAL row shows `routedLive: false`. Then re-enable. | Safety valve verified to actually disable routing |
+| **7k** | Commit + push + verify CI green | Step 7 lands on `main` |
+
+### 16.8 Smoke matrix (sub-step 7i)
+
+| Prompt | Heuristic | Semantic | Expected tier | Expected response.model |
+|---|---|---|---|---|
+| `thanks` (call 1) | trivial | (booting) | T1 (no_semantic conservative) | `deepseek-v4-pro` |
+| `thanks` (call 2) | trivial | T0 @ >0.80 | **T0** (both-agree) | `deepseek-v4-flash` |
+| `What's 2+2?` | neutral | T0 @ ~0.3 | T1 (asymmetric-cost) | `deepseek-v4-pro` |
+| Long Refactor | escalate | (skipped) | **T2** (heuristic fast path) | `gemini-3.1-pro-preview` |
+| Python+code | escalate | (skipped) | **T2** | `gemini-3.1-pro-preview` |
+| Bloom filter | neutral | T2 @ 1.0 | **T2** (semantic-driven) | `gemini-3.1-pro-preview` |
+
+Hard-escalation paths (long context > 200K tokens, multimodal attachments) are not easily exercised via CLI — covered by unit tests instead.
+
+### 16.9 Rollback plan
+
+In order of severity (least disruptive first):
+
+1. **Wrong tier mapping discovered in production:** Edit `~/.openclaw/openclaw.json` → set `plugins.entries.model-router.config.liveRouting = false` → `openclaw gateway restart`. Plugin reverts to observability-only; WAL still records the (now non-acted-on) decisions. ETA: <30s.
+2. **Plugin bug that affects request latency or quality even in observability mode:** `openclaw plugins disable model-router` → next request uses gateway default. ETA: <10s.
+3. **Plugin won't even load (e.g. tier validation throws):** `openclaw plugins disable model-router` then fix the config → re-enable. ETA: <60s.
+4. **Step 7 regression discovered after merge:** `git revert <sha>` → push → users `npm install` again. Restores Step 6 behavior (real decider in WAL, no overrides). ETA: <5min once identified.
+
+### 16.10 Risks and mitigations
+
+| Risk | Likelihood | Impact | Mitigation |
+|---|---|---|---|
+| Tier model names drift (provider deprecates `deepseek-v4-flash` etc.) | Low (1y horizon) | High — every routed request to that tier fails | `routedLive=true` rows in WAL grouped by `providerChosen + modelChosen` make the failing model obvious; CI doesn't catch this (no live API calls in CI) |
+| DeepSeek V4 Pro reasoning latency is high (multi-second TTFT for the thinking-mode variant), causing T1-default routing to feel sluggish | Medium | Medium — user perceives plugin as "made my agent slower" than the prior `gemini-3-pro-preview` baseline | Step 9 audit CLI surfaces median end-to-end latency by tier; if T1 dominates and is slow, the operator can flip the T1↔T2 mapping in config without code changes. Also: V4 Pro supports both Thinking and Non-Thinking modes — start with Non-Thinking for T1 (default) and reserve Thinking for T2 if needed |
+| Strict validation throws on a perfectly-fine tier-override-via-env-var setup we haven't anticipated | Low | High — gateway won't boot | Validation runs only when `liveRouting=true`; default `false` means new installs never hit this. Strict mode is opt-in by virtue of opting into live routing. Throw message embeds 3-option recovery hint (set `liveRouting=false`, fix the config, or disable the plugin) — operator can recover in <60s without reading docs |
+| T0 (deepseek-v4-flash) almost never picked because semantic confidence rarely clears the 0.80 threshold (Step 6 smoke saw 0.043 for `thanks`) | High | Low — money-saving deferred but no quality risk | INTENTIONAL per DESIGN.md §10's conservative-default policy. T0 phantom routing in week 1 is the *correct* behavior with only 20 T0 exemplars. Step 9 audit CLI will add an `exemplars harvest` sub-command that mines high-confidence WAL rows for new exemplar candidates, growing the T0 corpus from production data instead of guesswork |
+| Cost shock: most traffic routes to T1 (DeepSeek V4 Pro at ~$1-3/MTok) vs prior baseline of `google/gemini-3-pro-preview` ($2/$12). T1 actually saves money for the operator — but a misconfigured tier could route to T2/T3 unexpectedly, costing 5-10× more | Low | Medium — surprise bill | WAL audit (Step 9) surfaces tier distribution daily. Set up an alert if T2+T3 share exceeds 25% (Step 6 smoke showed ~30% T2, all heuristic-driven; if that ratio jumps it's actionable). Also: T1 default switching to V4 Pro is a pure cost WIN vs the prior Gemini 3 Pro baseline |
+| Gateway's `api.config.models.providers` shape isn't what we think | Medium | High — validation never matches → all installs throw | Step 7a includes a runtime probe — log the actual shape of `api.config.models.providers` at register-time so a mismatch is debuggable. Validation function is defensive — missing `providers` map returns no issues (skip validation) rather than throwing |
+
+### 16.11 Acceptance criteria
+
+Step 7 is "done" when ALL of these are true:
+
+1. `npm test` — 164/164 passing (137 + 13 + 14 new)
+2. `npm run plugin:ci` — PASS
+3. GitHub Actions green on `main`
+4. Live smoke matrix (§16.8) — every prompt's response.model matches its expected tier
+5. Kill-switch smoke (§16.7 step 7j) — verified
+6. README "GO-LIVE checklist" — written and copy-pasteable
+7. Build-stage badge bumped to 7/10
+8. DESIGN.md §16 marked `Status: Implemented (verified live YYYY-MM-DD)` once landed
 
 ---
 
