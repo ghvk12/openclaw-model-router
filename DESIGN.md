@@ -158,6 +158,48 @@ To keep the two plugins maintainable as a pair, deliberately reuse:
 > register-time which hooks the runtime accepts and degrade gracefully. The
 > Step 4 implementation defers all newer-hook subscriptions to Step 8 so v0.1
 > stays compatible with both runtime versions.
+>
+> **Per-process plugin lifecycle gap (discovered during Step 6 smoke test,
+> 2026-04-30):** The OpenClaw runtime instantiates the plugin in two distinct
+> process lifecycles, and `gateway_start` does not fire in both:
+>
+>   1. **Long-lived gateway daemon** (LaunchAgent / systemd): `gateway_start`
+>      fires once at boot, `before_model_resolve` fires many times across the
+>      daemon's lifetime. Both WAL init and semantic-classifier bootstrap can
+>      be done eagerly in `gateway_start`.
+>   2. **Per-invocation `openclaw agent` CLI host** (and similar short-lived
+>      hosts): each invocation re-loads the plugin module and fires
+>      `before_model_resolve`, but `gateway_start` is **not** emitted.
+>      Closure-default state (e.g. `runtime.semanticDeps = null`) silently
+>      stays uninitialized for the entire lifetime of the host process —
+>      breaking any code that depends on `gateway_start` having run.
+>
+> Step 4 surfaced this for the WAL writer (every CLI append silently dropped)
+> and we patched it with **lazy single-flight init on first append**. Step 6
+> smoke testing surfaced the SAME gap for the semantic classifier (every
+> CLI-side WAL row showed `["no_semantic"]` despite the daemon log claiming
+> "semantic classifier ready"). The fix is the same pattern, productionized
+> as `src/classifier/semantic-bootstrap.ts`:
+>
+>   - `SemanticBootstrap.ensureReady()` — awaitable, single-flight, called
+>     eagerly from `gateway_start` in the daemon path.
+>   - `SemanticBootstrap.kickoff()` — fire-and-forget, called from
+>     `before_model_resolve` in the request hot path. Daemon: no-op (already
+>     ready). CLI: starts the bootstrap in the background; first request
+>     in the process runs heuristic-only, subsequent requests in the same
+>     process see semantic kick in once the bootstrap settles.
+>   - `SemanticBootstrap.deps()` — synchronous read of current state.
+>
+> **Operational consequence**: the heaviest CLI users (e.g. WhatsApp's reply
+> path which pumps requests through the long-lived daemon) get full semantic
+> routing from the very first request. One-shot CLI smoke tests
+> (`openclaw agent --message "..."`) typically only run heuristic-only
+> because the process exits before the bootstrap finishes — that's an
+> inherent limitation of short-lived processes, not a bug. This trade-off
+> is the right call because (a) the heuristic path alone is conservative
+> and correct, and (b) blocking each CLI smoke test for ~1-7 seconds of
+> Ollama+Qdrant probing would be a much worse UX than degrading to
+> heuristic-only routing for short-lived hosts.
 
 ## 5. Routing decision algorithm
 

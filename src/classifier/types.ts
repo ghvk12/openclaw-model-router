@@ -81,16 +81,45 @@ export type RoutingDecision = {
  * Provenance label set used in `RoutingDecision.classifiers`. Stable
  * strings so the WAL is grep-friendly across releases — adding a new
  * label requires bumping the WAL schema version (Step 4).
+ *
+ * Label semantics:
+ *   heuristic_trivial         — heuristic flagged the prompt as trivial.
+ *   heuristic_escalate        — heuristic flagged the prompt as escalate.
+ *   heuristic_default         — Step 4 stub label only; superseded in Step 6.
+ *   heuristic_disagreed       — semantic said T0 but heuristic was neutral
+ *                               (asymmetric-cost rule kept us at T1).
+ *   semantic                  — final tier honors the semantic classifier
+ *                               (no boost, no override).
+ *   semantic_T0               — semantic vote landed on T0 specifically;
+ *                               combined with heuristic_trivial when both
+ *                               agree on trivial.
+ *   semantic_T1, _T2, _T3     — reserved for finer-grained semantic
+ *                               provenance; not all are emitted in v0.1.
+ *   semantic_failed           — runSemantic threw at request time
+ *                               (Qdrant/Ollama outage); fell back to T1.
+ *   no_semantic               — semantic classifier wasn't available
+ *                               (config disabled OR bootstrap failed).
+ *   sticky_prior              — kept the previous turn's tier because the
+ *                               semantic margin was below marginThreshold.
+ *   long_context_override     — token count exceeded longContextThreshold,
+ *                               forced to T3 (deterministic, never overridden).
+ *   multimodal_override       — image/video/audio attachment forced T3.
+ *   failover_substitute       — Step 8 substituted a different tier than
+ *                               the decider chose due to a circuit-breaker.
  */
 export type ClassifierLabel =
   | "heuristic_trivial"
   | "heuristic_escalate"
   | "heuristic_default"
+  | "heuristic_disagreed"
   | "semantic"
   | "semantic_T0"
   | "semantic_T1"
   | "semantic_T2"
   | "semantic_T3"
+  | "semantic_failed"
+  | "no_semantic"
+  | "sticky_prior"
   | "long_context_override"
   | "multimodal_override"
   | "failover_substitute";
