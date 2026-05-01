@@ -6,6 +6,9 @@ import { runHeuristics } from "./classifier/heuristics.js";
 import { stubDecide } from "./decider-stub.js";
 import { DecisionWAL, type DecisionRow } from "./decision-wal.js";
 import { estimateTokens } from "./tokens.js";
+import { createEmbedder } from "./classifier/embedder.js";
+import { RouterQdrantClient } from "./classifier/qdrant-router.js";
+import { seedExemplars } from "./classifier/seed-exemplars.js";
 
 /**
  * Step 4 (per DESIGN.md §15): observability before behavior change.
@@ -112,6 +115,21 @@ export default definePluginEntry({
 
     api.on("gateway_start", async (_event, _ctx) => {
       await wal.init();
+
+      // Bootstrap the semantic classifier's exemplar collection if (a)
+      // semantic is enabled in config and (b) Ollama + Qdrant are
+      // reachable. Failure is fail-soft: log loudly and continue with
+      // the heuristic-only classifier (which Step 4 already wires).
+      // Decision logic (Step 6) will fall back to T1 when the semantic
+      // classifier isn't ready.
+      if (cfg.classifier.semantic.enabled) {
+        await bootstrapSemanticClassifier(cfg, logger);
+      } else {
+        logger.info(
+          "model-router: semantic classifier disabled via config — skipping Qdrant bootstrap",
+        );
+      }
+
       logRouterReady(logger, cfg);
     });
 
@@ -148,4 +166,51 @@ function logRouterReady(logger: Logger, cfg: ResolvedConfig): void {
   }
   logger.info("model-router: ready — stub decider (always T1; WAL active; no model overrides yet)");
   logger.info(`model-router: config ${summarizeConfig(cfg)}`);
+}
+
+/**
+ * Probe Ollama, ensure the Qdrant collection exists, and (if needed)
+ * embed + upload the seed exemplars.
+ *
+ * Step 5 wires this into gateway_start so by the time Step 6 lands
+ * `runSemantic` calls, the exemplar collection is already populated.
+ *
+ * Fail-soft: any error here is logged and swallowed. The semantic
+ * classifier won't run, but the gateway stays up and the heuristic
+ * classifier + stub decider continue to work. Step 6's decider must
+ * tolerate a "semantic unavailable" condition by falling back to T1.
+ */
+async function bootstrapSemanticClassifier(
+  cfg: ResolvedConfig,
+  logger: Logger,
+): Promise<void> {
+  try {
+    const embedder = createEmbedder(cfg.classifier.semantic.embeddings, logger);
+    const probe = await embedder.probe();
+    if (!probe.ok) {
+      logger.warn(
+        `model-router: Ollama probe failed (${probe.reason ?? "unknown"}) — semantic classifier disabled for this session`,
+      );
+      return;
+    }
+    const qdrant = new RouterQdrantClient(
+      cfg.classifier.semantic,
+      cfg.classifier.semantic.embeddings.dim,
+      logger,
+    );
+    const result = await seedExemplars(embedder, qdrant, logger);
+    if (result.status === "skipped") {
+      logger.info(
+        `model-router: semantic classifier ready (collection=${cfg.classifier.semantic.qdrant.collection}, exemplars=${result.existingCount}, source=existing)`,
+      );
+    } else {
+      logger.info(
+        `model-router: semantic classifier ready (collection=${cfg.classifier.semantic.qdrant.collection}, exemplars=${result.pointsWritten}, source=fresh-seed, durationMs=${result.durationMs.toFixed(0)})`,
+      );
+    }
+  } catch (err) {
+    logger.error(
+      `model-router: semantic classifier bootstrap failed — falling back to heuristic-only routing: ${String(err)}`,
+    );
+  }
 }
