@@ -1,19 +1,23 @@
 # openclaw-model-router
 
 [![CI](https://github.com/ghvk12/openclaw-model-router/actions/workflows/plugin-inspector.yml/badge.svg?branch=main)](https://github.com/ghvk12/openclaw-model-router/actions/workflows/plugin-inspector.yml)
-![Status](https://img.shields.io/badge/status-pre--alpha-orange)
-![Build Stage](https://img.shields.io/badge/build-step%209%2F10-yellow)
+![Status](https://img.shields.io/badge/status-alpha-brightgreen)
+![Build Stage](https://img.shields.io/badge/build-step%2010%2F10-brightgreen)
 ![OpenClaw](https://img.shields.io/badge/openclaw-%E2%89%A52026.4.20-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
 Tiered model router for [OpenClaw](https://github.com/openclaw/openclaw) — picks the cheapest sufficient model per turn via a heuristic + semantic-kNN classifier.
 
-> **Status: CLI audit & exemplars-harvest shipped (Step 9 of 10).** Two new CLI commands give operators visibility into routing quality:
+> **Status: All 10 build steps complete.** The model router is fully operational with live routing, failover, observability CLI, and CI. Summary of what shipped:
 >
-> - `npm run audit -- --since=30d` — prints a summary of tier distribution, failover rate, live-routed percentage, classifier breakdown, latency percentiles (p50/p95/p99/mean), and average confidence across all WAL data in the window.
-> - `npm run harvest -- --since=30d --min-confidence=0.70 --format=json` — mines high-confidence, non-failover decision rows as seed-exemplar candidates for tuning the semantic kNN classifier.
+> - **Tiered routing** — heuristic + semantic kNN classifier picks T0–T3 per prompt complexity
+> - **Live model override** — `before_model_resolve` hook steers the gateway to the chosen tier's provider/model
+> - **Failover & circuit breaker** — reactive per-runId substitution + proactive per-model circuit breaker
+> - **Observability** — JSONL WAL with daily rotation, sampling, prompt hashing
+> - **CLI tools** — `npm run audit` (tier distribution, failover rate, latency percentiles) and `npm run harvest` (exemplar mining for classifier tuning)
+> - **CI** — GitHub Actions runs Vitest (239 tests) + `plugin-inspector ci` on every push
 >
-> Verified live against 92 production decisions: 65.2% T2, 34.8% T1; 2.2% failover rate; p50 latency 0.25ms; 32 exemplar candidates harvested at confidence ≥ 0.70. **239 unit tests** across 14 files — `Status: PASS, Breakages: 0` from `plugin-inspector ci`.
+> Verified live across 92 production decisions over 14 days. **239 unit tests** across 14 files — `Status: PASS, Breakages: 0`.
 >
 > **Default tier mapping (cleanly monotonic cost ladder):**
 > - **T0** = `deepseek/deepseek-v4-flash` (~$0.10-0.30 / MTok)

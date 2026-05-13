@@ -803,6 +803,10 @@ The plugin is shippable when:
    18 unit tests added (239 total).
 10. CI: `plugin-inspector ci --no-openclaw --runtime --mock-sdk --allow-execute`
     (mirrors memory-rag's `plugin:ci` script).
+    **Implemented (2026-05-13).** GitHub Actions workflow enhanced to run
+    Vitest (239 tests) before `plugin-inspector ci`. README badges updated
+    to 10/10 + status changed from pre-alpha to alpha. All 10 build steps
+    complete.
 
 ---
 
