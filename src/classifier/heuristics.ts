@@ -59,15 +59,15 @@ export function runHeuristics(
     });
   }
 
-  // ── Escalate signal (a): code fence ──────────────────────────────────
-  // Plain string check — no regex needed, tolerates triple-backticks
-  // followed by a language tag (```ts, ```python, etc).
-  if (prompt.includes("```")) {
-    escalate = true;
-    reasons.push({ kind: "escalate_code_fence" });
-  }
-
-  // ── Escalate signal (b): keyword pattern hit ─────────────────────────
+  // ── Escalate signal (a): keyword pattern hit ──────────────────────────
+  // Code-fence detection was previously hardcoded here via
+  // `prompt.includes("```")`, but the full assembled prompt includes
+  // chat history — any prior assistant response containing code fences
+  // caused EVERY subsequent prompt to escalate to T2.  Removed in favor
+  // of the configurable `escalatePatterns` array: operators who want
+  // code-fence escalation can add "```" there (the default pattern set
+  // still includes it), and those who hit false positives from history
+  // can drop it without forking the plugin.
   const escalateHit = firstRegexHit(prompt, cfg.escalatePatterns);
   if (escalateHit !== undefined) {
     escalate = true;
@@ -78,7 +78,7 @@ export function runHeuristics(
     });
   }
 
-  // ── Escalate signal (c): long prompt ─────────────────────────────────
+  // ── Escalate signal (b): long prompt ─────────────────────────────────
   // Even without keyword hits, a multi-KB prompt almost always benefits
   // from reasoning capacity (and the cost delta from T1→T2 is small
   // compared to the cost of being wrong on a long-context request).
@@ -87,7 +87,7 @@ export function runHeuristics(
     reasons.push({ kind: "escalate_long_prompt", promptChars });
   }
 
-  // ── Escalate signal (d): code density ────────────────────────────────
+  // ── Escalate signal (c): code density ────────────────────────────────
   // Counts file-path-like AND function-call-like tokens; a combined ≥3
   // is a strong signal that the prompt is about code (refactoring,
   // debugging) even when no keyword fires.

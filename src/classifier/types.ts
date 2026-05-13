@@ -22,7 +22,6 @@ import type { TierId } from "../config.js";
 export type HeuristicReason =
   | { kind: "trivial_short_no_question"; promptChars: number }
   | { kind: "trivial_pattern_match"; pattern: string; matched: string }
-  | { kind: "escalate_code_fence" }
   | { kind: "escalate_pattern_match"; pattern: string; matched: string }
   | { kind: "escalate_long_prompt"; promptChars: number }
   | { kind: "escalate_code_density"; pathHits: number; callHits: number };

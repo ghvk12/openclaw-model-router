@@ -70,12 +70,12 @@ describe("runHeuristics — trivial signals", () => {
 });
 
 describe("runHeuristics — escalate signals", () => {
-  it("escalates on a triple-backtick code fence", () => {
+  it("escalates on a triple-backtick code fence via escalatePatterns", () => {
     const r = runHeuristics("Look at this:\n```ts\nconst x = 1;\n```", cfg);
-    expect(r.escalate, "code fence should escalate").toBe(true);
+    expect(r.escalate, "code fence should escalate via pattern").toBe(true);
     expect(
-      r.reasons.some((x) => x.kind === "escalate_code_fence"),
-      "should record escalate_code_fence reason",
+      r.reasons.some((x) => x.kind === "escalate_pattern_match"),
+      "should record escalate_pattern_match reason for code fence",
     ).toBe(true);
   });
 
