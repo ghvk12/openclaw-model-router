@@ -37,7 +37,9 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "plugin:check": "plugin-inspector inspect --no-openclaw",
-    "plugin:ci": "plugin-inspector ci --no-openclaw --runtime --mock-sdk --allow-execute"
+    "plugin:ci": "plugin-inspector ci --no-openclaw --runtime --mock-sdk --allow-execute",
+    "audit": "node ./dist/cli.js audit",
+    "harvest": "node ./dist/cli.js harvest"
   },
   "openclaw": {
     "extensions": [

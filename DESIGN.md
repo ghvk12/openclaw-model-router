@@ -793,6 +793,14 @@ The plugin is shippable when:
    "exemplar tuning scope" decision) that mines high-confidence WAL
    rows to propose new T0/T1/T2 exemplars for operator approval —
    data-driven semantic-classifier improvement instead of guesswork.
+   **Implemented (2026-05-13).** Two CLI commands shipped:
+   `npm run audit -- --since=30d` (tier distribution, failover rate,
+   classifier breakdown, latency percentiles, confidence); `npm run
+   harvest -- --since=30d --min-confidence=0.70 --format=json|tsv`
+   (mines high-confidence non-failover WAL rows as exemplar candidates,
+   deduplicates by promptHash, sorted by confidence descending).
+   Verified live: 92 decisions audited, 32 exemplar candidates harvested.
+   18 unit tests added (239 total).
 10. CI: `plugin-inspector ci --no-openclaw --runtime --mock-sdk --allow-execute`
     (mirrors memory-rag's `plugin:ci` script).
 

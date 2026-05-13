@@ -2,13 +2,18 @@
 
 [![CI](https://github.com/ghvk12/openclaw-model-router/actions/workflows/plugin-inspector.yml/badge.svg?branch=main)](https://github.com/ghvk12/openclaw-model-router/actions/workflows/plugin-inspector.yml)
 ![Status](https://img.shields.io/badge/status-pre--alpha-orange)
-![Build Stage](https://img.shields.io/badge/build-step%208%2F10-yellow)
+![Build Stage](https://img.shields.io/badge/build-step%209%2F10-yellow)
 ![OpenClaw](https://img.shields.io/badge/openclaw-%E2%89%A52026.4.20-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
 Tiered model router for [OpenClaw](https://github.com/openclaw/openclaw) — picks the cheapest sufficient model per turn via a heuristic + semantic-kNN classifier.
 
-> **Status: Failover & circuit-breaker shipped (Step 8 of 10).** The router now substitutes broken tiers on the fly so the gateway's failover candidates actually go somewhere different. Pre-Step-8, when the router decided T2 (Google) and Google's quota was exhausted, the gateway re-invoked `before_model_resolve` for each failover candidate — and our hook unconditionally re-overrode every attempt back to the broken Google tier. Net result: all failover candidates funneled to the same broken provider, and live traffic surfaced "All Models are temporarily rate-limited" with zero substitution. Step 8 closes the loop with two cooperating mechanisms: **(1) reactive substitution** (`RunAttemptTracker` + `substituteTier`) — tracks per-runId attempts inside the hook itself; on re-invocation for the same runId, walks an always-promote-never-demote-then-fallback ladder (T0→T1, T1→T2, T2→T1, T3→T2) so retries actually land on a different tier (verified live: WAL row pair shows `tierChosen=T2, originalTier=T2, failoverApplied=true` flipping to `tierChosen=T1` on the gateway's failover re-invocation). **(2) proactive circuit breaker** — per-`provider/model` state machine (closed → open after `consecutiveFailureThreshold=3` failures → half_open after `cooldownMs=60000` → closed on probe success); `substituteTier` consults the breaker so a known-broken provider gets routed around on the FIRST attempt without paying the latency of a definitely-failing call. The breaker is wired but its outcome-feed is intentionally deferred (no stable outcome hook in runtime 2026.4.24 — see DESIGN.md §11) so it currently lights up only via the reactive path. **221 unit tests** across 13 files (+42 failover) — `Status: PASS, Breakages: 0` from `plugin-inspector ci`. Previous Step-7 GO-LIVE, validation, and observability-only kill-switch all still work (`liveRouting=false` is still the conservative default). See DESIGN.md §6 + §16.12 for the full failover spec including the WAL bug-pattern that motivated this step.
+> **Status: CLI audit & exemplars-harvest shipped (Step 9 of 10).** Two new CLI commands give operators visibility into routing quality:
+>
+> - `npm run audit -- --since=30d` — prints a summary of tier distribution, failover rate, live-routed percentage, classifier breakdown, latency percentiles (p50/p95/p99/mean), and average confidence across all WAL data in the window.
+> - `npm run harvest -- --since=30d --min-confidence=0.70 --format=json` — mines high-confidence, non-failover decision rows as seed-exemplar candidates for tuning the semantic kNN classifier.
+>
+> Verified live against 92 production decisions: 65.2% T2, 34.8% T1; 2.2% failover rate; p50 latency 0.25ms; 32 exemplar candidates harvested at confidence ≥ 0.70. **239 unit tests** across 14 files — `Status: PASS, Breakages: 0` from `plugin-inspector ci`.
 >
 > **Default tier mapping (cleanly monotonic cost ladder):**
 > - **T0** = `deepseek/deepseek-v4-flash` (~$0.10-0.30 / MTok)
