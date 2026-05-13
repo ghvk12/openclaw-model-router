@@ -43,6 +43,15 @@ export type DecisionRow = {
   /** Whether failover.ts substituted the picked tier with a different one. */
   failoverApplied: boolean;
   /**
+   * Tier the decider originally picked, BEFORE Step 8's failover/substitution
+   * mutated `tierChosen`. Only populated when `failoverApplied=true` so the
+   * audit CLI can answer "what would have been routed without failover?"
+   * without parsing the `reason` field. Optional for backward compatibility
+   * with WAL rows written before Step 8 added the field — rows missing this
+   * field imply no substitution happened (i.e. `tierChosen` was the original).
+   */
+  originalTier?: TierId;
+  /**
    * Whether the router actually returned `{ modelOverride, providerOverride }`
    * to the gateway for this decision (i.e. live routing was active and the
    * tier passed validation). Optional for backward compatibility with WAL

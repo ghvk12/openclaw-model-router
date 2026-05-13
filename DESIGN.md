@@ -367,6 +367,103 @@ This is built into the router itself, not delegated to an external gateway,
 because we need the substitution decision visible in the same WAL as the
 routing decisions.
 
+### 6.1 Implementation notes (Step 8 — what actually shipped)
+
+The §6 spec above is the **design intent** (proactive, outcome-fed circuit
+breaker). What ships in Step 8 (`src/failover.ts`) is a **superset of §6**
+that adds a second cooperating mechanism — and intentionally defers a piece
+of §6 — based on the bug pattern we found in production.
+
+**The bug §6 alone wouldn't have caught.** When the gateway's own model
+fallback chain is enabled (e.g. `google/gemini-3.1-pro-preview` →
+`deepseek/deepseek-chat` → `deepseek/deepseek-reasoner`), the gateway
+**re-invokes `before_model_resolve` for every candidate**. Pre-Step-8 our
+hook unconditionally returned the same `{modelOverride, providerOverride}`
+on every invocation — so all three failover candidates got forced back
+onto the broken Google tier. The user saw "All Models are temporarily
+rate-limited" with three identical failures in the WAL. §6's
+outcome-fed breaker would have eventually opened (after 3 failures) and
+substituted on the NEXT request — but by then the user has already been
+told to "try again in a few minutes". §6 alone is too slow.
+
+**What Step 8 shipped:**
+
+1. **Reactive substitution (NEW — not in §6).** A `RunAttemptTracker`
+   remembers per-`runId` attempts inside the hook itself. On a re-invocation
+   of `before_model_resolve` for the same runId, we KNOW the previous
+   attempt failed (the gateway wouldn't re-invoke otherwise). `substituteTier`
+   walks an always-promote-never-demote-then-fallback ladder and returns
+   a different tier for the retry. The same `runId` thread that used to
+   produce three identical Google failures now produces three DIFFERENT
+   tier attempts (T2 → T1 → T3 → T0 → undefined), so the gateway's
+   failover chain can actually find a working provider on a single user
+   request.
+
+2. **Proactive circuit breaker (per §6, scope-trimmed).** The
+   `CircuitBreaker` class implements the `closed → open → half_open →
+   closed` state machine §6 specs, with **two intentional v1 trims**:
+
+   - **Trip rule simplified to consecutive-only.** §6 specs an OR of
+     `errorRate > 0.5 over window AND consecutiveFailures >= 3`. The
+     window-based path turned out to be hard to make non-degenerate
+     without also tracking successes (which inflates memory and adds an
+     ergonomics question — what timestep, what window). The consecutive
+     path catches the dominant production failure (rate_limit / quota —
+     bursts of identical errors) cleanly. The `errorRateThreshold` and
+     `windowSize` config fields are retained for a v2 enhancement but
+     are currently unused. `windowSize` still bounds the in-memory
+     failure log for `keys()` observability.
+   - **Outcome feed deferred.** §6 says the breaker is fed by
+     `model_call_started` / `model_call_ended`. The runtime gateway
+     2026.4.24 (per §11) doesn't expose `model_call_ended` to non-bundled
+     plugins, and `agent_end` is gated behind `hooks.allowConversationAccess`
+     — neither was acceptable for a fail-soft v1. The breaker is wired
+     up and `substituteTier` consults it, so the proactive path lights
+     up the moment a future SDK update or a bundled plugin promotion
+     gives us a stable outcome hook.
+
+3. **Substitution ladder revised.** §6 originally said `T2 TRIPPED → T3`
+   and `T3 TRIPPED → T2 (accept context truncation)`. Step 8 ships a
+   slightly different policy: `T2 TRIPPED → T1` (de-escalate) and `T3
+   TRIPPED → T2`. Rationale: T1 (deepseek-v4-pro) is cheaper AND has
+   demonstrated higher reliability than T3 (anthropic/claude-opus-4-6)
+   in our production WAL. Escalating to the most expensive tier as
+   fallback is the wrong cost shape — most prompts that route to T2
+   don't actually need T3 capability, they routed to T2 because of
+   heuristic patterns, not capability requirements.
+
+   The full ladder (`SUBSTITUTION_LADDER` in `src/failover.ts`):
+
+   | Source tier broken/attempted | Try next |
+   |---|---|
+   | T0 | T1 (escalate — only useful step up from cheapest) |
+   | T1 | T2 (escalate — richer reasoning) |
+   | T2 | T1 (de-escalate — cheaper than T3, usually adequate) |
+   | T3 | T2 (de-escalate) |
+
+   After the first candidate fails too, the ladder continues with the
+   remaining tiers (each ladder enumerates all four tiers in priority
+   order — see test `SUBSTITUTION_LADDER (DESIGN.md §6 minimum-movement
+   policy)`). Only when ALL four are exhausted does `substituteTier`
+   return `null` — at which point the hook returns `undefined` from
+   `before_model_resolve` and the gateway falls back to its own default
+   chain. The plugin becomes invisible for that one request, which is
+   the safest possible degradation.
+
+4. **WAL fields added.** `DecisionRow` gains `originalTier?: TierId`
+   (only populated when `failoverApplied=true`) and the `reason` field
+   gets a `" | failover X→Y (trigger_kind)"` suffix when substitution
+   applies. The Step 9 audit CLI can answer "what would have routed
+   without failover?" without parsing the prose reason field.
+
+5. **Hot-path safety.** `substituteTier` and the breaker's read methods
+   are pure (no I/O, no allocations beyond a defensive copy), so the
+   added latency is sub-microsecond. The tracker is bounded
+   (`maxRuns=1024`, `runTtlMs=5min`) so memory stays predictable across
+   leaked runs.
+
+Live-verification evidence: see §16.13.
+
 ## 7. Configuration
 
 Lives in `~/.openclaw/openclaw.json`. Example block:
@@ -1042,6 +1139,89 @@ google provider. Routing `google/gemini-3-1-pro-preview` returns
 `model_not_found` from the google provider. The `T2` default in
 `src/config.ts` uses dots (`gemini-3.1-pro-preview`) and includes a
 comment explaining the trap.
+
+### 16.13 Step 8 live verification — failover & substitution (2026-05-13)
+
+**The motivating bug** — production WhatsApp traffic was returning "All
+Models are temporarily rate-limited. Please try again in a few minutes."
+to users. The gateway logs showed the failure pattern:
+
+```
+[hooks] provider overridden to google
+[hooks] model overridden to gemini-3.1-pro-preview
+→ Google API 429: RESOURCE_EXHAUSTED (free-tier quota exhausted)
+→ auth profile google → cooldown window
+→ Gateway tries failover candidate deepseek/deepseek-chat
+→ [hooks] provider overridden to google ← OUR HOOK FIRES AGAIN
+→ [hooks] model overridden to gemini-3.1-pro-preview ← FORCES BACK TO GOOGLE
+→ "No available auth profile for google (all in cooldown)"
+→ Repeat for next 2 failover candidates (all forced back to google)
+→ "All models failed (3)" → user sees the error string
+```
+
+The gateway's failover chain was being short-circuited by our re-override
+on every attempt. **§6's outcome-fed breaker would have helped on the
+NEXT request** (after seeing 3 failures), but the user has already been
+told to "try again in a few minutes" by then. We needed in-request
+substitution.
+
+**The fix shipped (§6.1)** — a `RunAttemptTracker` inside the hook itself,
+plus `substituteTier` walking a fail-soft ladder. Verified live with a
+heuristic-escalating prompt that lands on T2:
+
+```sh
+$ openclaw agent --session-id smoke-step8-T2-failover \
+   -m "Refactor the architect of our payment system step-by-step \
+       and explain the tradeoff between approaches"
+```
+
+WAL trace (`~/.openclaw/model-router/wal/decisions-2026-05-13.jsonl`):
+
+```jsonl
+# Turn 1 of runId d0d8b313 — router decides T2, gateway calls google
+{"runId":"d0d8b313-...","tierChosen":"T2","providerChosen":"google",
+ "modelChosen":"gemini-3.1-pro-preview",
+ "reason":"heuristic escalate: escalate_pattern_match:Refactor",
+ "failoverApplied":false,"routedLive":true}
+
+# Turn 2 — SAME runId, gateway re-invoked us for the failover candidate.
+# Step 8's RunAttemptTracker sees the prior T2 attempt, substituteTier
+# walks the T2 ladder, returns T1 (de-escalation). originalTier captured.
+{"runId":"d0d8b313-...","tierChosen":"T1","providerChosen":"deepseek",
+ "modelChosen":"deepseek-v4-pro",
+ "reason":"heuristic escalate: escalate_pattern_match:Refactor | failover T2→T1 (already_attempted_in_run)",
+ "failoverApplied":true,"originalTier":"T2","routedLive":true}
+```
+
+**Pre-Step-8 behavior** would have been three rows with identical
+`tierChosen=T2, providerChosen=google` (same broken tier on every
+attempt). **Step 8 behavior** is two rows with different tiers — the
+gateway's failover chain now actually finds a working provider.
+
+The `routedLive: true` on the substituted row confirms that the override
+returned to the gateway used the SUBSTITUTED tier (T1), not the original
+T2. That's the fix.
+
+**Boot logs confirm Step 8 is loaded:**
+
+```
+2026-05-13T10:15:21.502 [plugins] model-router: ready — LIVE ROUTING
+2026-05-13T10:15:21.503 [plugins] model-router: failover armed — substitution ladder enabled, breaker consecutiveFailureThreshold=3 cooldownMs=60000
+```
+
+**Test posture:** 221 unit tests across 13 files (+42 in `tests/failover.test.ts`
+covering the LRU tracker, the breaker state machine including OPEN→HALF_OPEN→CLOSED
+recovery, the substitution ladder shape, in-run retry, breaker-driven
+substitution, exhaustion fallback, and a regression test for the exact
+WhatsApp bug pattern). `plugin-inspector ci` reports `Status: PASS,
+Breakages: 0`.
+
+**Known followup (not blocking):** the breaker's outcome feed is wired
+but unfed (no stable hook in runtime 2026.4.24). When a future SDK
+update adds `model_call_ended` to the public hook surface, wiring is a
+~10-line addition in `src/index.ts` and the proactive substitution path
+(skip a known-broken provider on the FIRST request, not just on retries)
+lights up automatically.
 
 ---
 

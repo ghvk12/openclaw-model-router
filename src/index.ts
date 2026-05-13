@@ -13,6 +13,12 @@ import {
   formatValidationError,
   type GatewayConfigShape,
 } from "./router-validate.js";
+import {
+  RunAttemptTracker,
+  CircuitBreaker,
+  substituteTier,
+  modelKeyOf,
+} from "./failover.js";
 
 /**
  * Step 7 (per DESIGN.md §15, §16): GO-LIVE — the plugin now returns
@@ -111,6 +117,18 @@ export default definePluginEntry({
 
     const wal = new DecisionWAL(cfg.observability, logger);
     const priorTierCache = new PriorTierCache();
+    // Step 8 — reactive failover state (DESIGN.md §6, §16.12).
+    //
+    // The tracker remembers per-runId attempts so re-invocations of
+    // before_model_resolve (which the gateway issues for every failover
+    // candidate) can SUBSTITUTE to a different tier instead of re-forcing
+    // the broken one. The breaker holds cross-runId failure state for
+    // proactive substitution; its outcome-feed is deferred (no stable
+    // hook in runtime 2026.4.24 — see DESIGN.md §11) but the breaker is
+    // already consulted by `substituteTier` so the proactive path lights
+    // up the moment the feed lands.
+    const runAttemptTracker = new RunAttemptTracker();
+    const circuitBreaker = new CircuitBreaker(cfg.failover);
     // Single-flight semantic-classifier bootstrap. Both lifecycles
     // converge here:
     //   - Long-lived gateway daemon: gateway_start awaits ensureReady()
@@ -157,33 +175,87 @@ export default definePluginEntry({
           const decision = outcome.decision;
 
           // Update the prior-tier cache for the NEXT turn of this session.
-          // We track the decided tier (not the actually-routed tier) so
-          // sticky-prior bias reflects the router's intent rather than
-          // any failover substitutions that happen later (Step 8).
+          // We track the ORIGINALLY-decided tier (not any failover
+          // substitution we apply below) so sticky-prior bias reflects
+          // the router's intent — failover noise stays out of session
+          // memory.
           priorTierCache.set(sessionKey, decision.tier);
+
+          // Step 8 — reactive failover & substitution.
+          //
+          // Look at prior attempts in this same agent run. If THIS is
+          // the first invocation of before_model_resolve for runId, the
+          // priors list is empty → substituteTier returns the original
+          // tier unchanged. If the gateway is re-invoking us for a
+          // failover attempt (same runId, second call), the priors
+          // contain the original tier → substituteTier walks the
+          // ladder and returns a different tier. This breaks the
+          // "router re-forces the broken tier on every failover
+          // candidate" loop that caused the WhatsApp outage.
+          const runId = ctx.runId ?? "";
+          const priors = runAttemptTracker.priors(runId);
+          const substitution = substituteTier(decision.tier, cfg, priors, circuitBreaker);
+
+          // Determine the tier we'll actually route to.
+          //   - Happy path (no substitution): use decision.tier
+          //   - Substituted to another tier: use substitution.tier
+          //   - All tiers exhausted (substitution.tier === null): return
+          //     undefined so the gateway falls back to its own default
+          //     chain. We still record the attempt + WAL row.
+          let effectiveTier = decision.tier;
+          if (substitution.applied && substitution.tier !== null) {
+            effectiveTier = substitution.tier;
+            logger.warn(
+              `model-router: ${substitution.reason} (runId=${runId.slice(0, 8) || "?"})`,
+            );
+          } else if (substitution.applied && substitution.tier === null) {
+            logger.warn(
+              `model-router: ${substitution.reason} (runId=${runId.slice(0, 8) || "?"}) — returning undefined`,
+            );
+          }
+
+          const effectiveTierConfig = cfg.tiers[effectiveTier];
+          // Record THIS attempt so the next invocation in the same run
+          // (if any — i.e. the gateway hits another failover candidate)
+          // can advance further along the ladder.
+          if (runId) {
+            runAttemptTracker.record(runId, {
+              tier: effectiveTier,
+              modelKey: modelKeyOf(effectiveTierConfig),
+              ts: Date.now(),
+            });
+          }
 
           // Step 7 GO-LIVE: convert the decision into the SDK
           // override shape iff cfg.liveRouting=true. Returns undefined
           // when liveRouting=false (observability mode preserved).
-          const override = toModelOverride(decision, cfg);
+          // We hand toModelOverride a decision-shaped object pointing at
+          // the EFFECTIVE tier so the override matches what we actually
+          // want the gateway to call.
+          const override =
+            substitution.tier === null
+              ? undefined // surrender to gateway default
+              : toModelOverride({ ...decision, tier: effectiveTier }, cfg);
 
-          const tier = cfg.tiers[decision.tier];
           const row: DecisionRow = {
             ts: Date.now(),
-            runId: ctx.runId ?? "",
+            runId,
             promptHash: DecisionWAL.hashPrompt(event.prompt ?? ""),
             promptLen: (event.prompt ?? "").length,
             tokenCountEstimate: estimateTokens(event.prompt ?? ""),
-            tierChosen: decision.tier,
-            providerChosen: tier.provider,
-            modelChosen: tier.model,
+            tierChosen: effectiveTier,
+            providerChosen: effectiveTierConfig.provider,
+            modelChosen: effectiveTierConfig.model,
             confidence: decision.confidence,
             classifiers: decision.classifiers,
-            reason: decision.reason,
+            reason: substitution.applied
+              ? `${decision.reason} | ${substitution.reason}`
+              : decision.reason,
             classifierLatencyMs: outcome.trace.totalLatencyMs,
             priorTier,
-            failoverApplied: false,
+            failoverApplied: substitution.applied,
             routedLive: override !== undefined,
+            ...(substitution.applied ? { originalTier: decision.tier } : {}),
           };
 
           // Fire-and-forget — never await. A slow disk shouldn't add
@@ -279,6 +351,9 @@ function logRouterReady(logger: Logger, cfg: ResolvedConfig): void {
       "model-router: ready — observability-only mode. Decisions are computed and recorded in the WAL with routedLive=false; no modelOverride is returned to the gateway. Set plugins.entries.model-router.config.liveRouting = true in openclaw.json to GO LIVE",
     );
   }
+  logger.info(
+    `model-router: failover armed — substitution ladder enabled, breaker consecutiveFailureThreshold=${cfg.failover.consecutiveFailureThreshold} cooldownMs=${cfg.failover.cooldownMs}`,
+  );
   logger.info(`model-router: config ${summarizeConfig(cfg)}`);
 }
 
